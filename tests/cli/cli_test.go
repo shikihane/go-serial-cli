@@ -755,26 +755,18 @@ func TestOpenStoresNamedSession(t *testing.T) {
 	}
 }
 
-func TestOpenStartsSessionWorkerAndRecordsControlAddress(t *testing.T) {
+func TestOpenDoesNotStartSessionWorkerOrHoldPort(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	app := cli.New(cli.AppDeps{
 		Store: store,
 		ReserveControlAddress: func() (string, error) {
-			return "127.0.0.1:7002", nil
+			t.Fatal("open should not reserve a control listener")
+			return "", nil
 		},
 		StartWorker: func(name string) (int, error) {
-			if name != "dev1" {
-				t.Fatalf("worker session = %q, want dev1", name)
-			}
-			state, err := store.Load(name)
-			if err != nil {
-				t.Fatalf("Load in StartWorker returned error: %v", err)
-			}
-			if state.ControlAddress != "127.0.0.1:7002" {
-				t.Fatalf("ControlAddress = %q, want 127.0.0.1:7002", state.ControlAddress)
-			}
-			return 4242, nil
+			t.Fatalf("open should not start worker for %q", name)
+			return 0, nil
 		},
 	})
 
@@ -786,7 +778,7 @@ func TestOpenStartsSessionWorkerAndRecordsControlAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.ControlAddress != "127.0.0.1:7002" || got.WorkerPID != 4242 {
+	if got.ControlAddress != "" || got.WorkerPID != 0 || got.Status != session.StatusConfigured {
 		t.Fatalf("state = %#v", got)
 	}
 }
@@ -804,20 +796,8 @@ func TestOpenPreservesExistingTCPForwarding(t *testing.T) {
 			return "", nil
 		},
 		StartWorker: func(name string) (int, error) {
-			state, err := store.Load(name)
-			if err != nil {
-				t.Fatalf("Load in StartWorker returned error: %v", err)
-			}
-			if state.TCPAddress != "127.0.0.1:47017" || state.ControlAddress != "" {
-				t.Fatalf("state before worker = %#v", state)
-			}
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=tcp pid=47017 listen=127.0.0.1:47017"); err != nil {
-				t.Fatalf("AppendLog start returned error: %v", err)
-			}
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker ready listen=127.0.0.1:47017"); err != nil {
-				t.Fatalf("AppendLog ready returned error: %v", err)
-			}
-			return 47017, nil
+			t.Fatalf("open should not restart worker for %q", name)
+			return 0, nil
 		},
 		IsProcessRunning: func(pid int) bool {
 			return pid == 47017
@@ -832,100 +812,35 @@ func TestOpenPreservesExistingTCPForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.Port != "COM3" || got.Baud != 115200 || got.Status != session.StatusTCP || got.TCPAddress != "127.0.0.1:47017" || got.WorkerPID != 47017 {
+	if got.Port != "COM3" || got.Baud != 115200 || got.Status != session.StatusTCP || got.TCPAddress != "127.0.0.1:47017" || got.WorkerPID != 0 {
 		t.Fatalf("state = %#v", got)
 	}
 }
 
-func TestOpenReturnsSessionWorkerStartupErrorAndClearsPID(t *testing.T) {
+func TestOpenIgnoresUnavailableSerialPortUntilLiveCommand(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
-	workerPID := 10565
-	waitErr := errors.New("wait for session control 127.0.0.1:10565: connection refused")
 	app := cli.New(cli.AppDeps{
 		Store: store,
 		ReserveControlAddress: func() (string, error) {
-			return "127.0.0.1:10565", nil
+			t.Fatal("open should not reserve a control listener")
+			return "", nil
 		},
 		StartWorker: func(name string) (int, error) {
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=session pid=10565 control=127.0.0.1:10565"); err != nil {
-				t.Fatalf("AppendLog start returned error: %v", err)
-			}
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker error open COM5: Access is denied."); err != nil {
-				t.Fatalf("AppendLog error returned error: %v", err)
-			}
-			return workerPID, nil
-		},
-		WaitForControl: func(address string) error {
-			return waitErr
-		},
-		IsProcessRunning: func(pid int) bool {
-			return pid == workerPID
-		},
-		StopProcess: func(pid int) error {
-			return nil
+			t.Fatalf("open should not start worker for %q", name)
+			return 0, nil
 		},
 	})
 
-	err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out)
-	if err == nil {
-		t.Fatal("expected worker startup error")
-	}
-	if !strings.Contains(err.Error(), "open COM5: Access is denied.") {
-		t.Fatalf("error = %q, want worker serial error", err)
+	if err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 	got, err := store.Load("dev1")
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.WorkerPID != 0 {
-		t.Fatalf("WorkerPID = %d, want 0", got.WorkerPID)
-	}
-}
-
-func TestOpenReturnsSessionWorkerRetryErrorAndClearsPID(t *testing.T) {
-	var out bytes.Buffer
-	store := session.Store{Dir: t.TempDir()}
-	workerPID := 10565
-	waitErr := errors.New("wait for session control 127.0.0.1:10565: connection refused")
-	app := cli.New(cli.AppDeps{
-		Store: store,
-		ReserveControlAddress: func() (string, error) {
-			return "127.0.0.1:10565", nil
-		},
-		StartWorker: func(name string) (int, error) {
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=session pid=10565 control=127.0.0.1:10565"); err != nil {
-				t.Fatalf("AppendLog start returned error: %v", err)
-			}
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker retry error=\"open serial port COM5: Serial port busy\" delay=250ms"); err != nil {
-				t.Fatalf("AppendLog retry returned error: %v", err)
-			}
-			return workerPID, nil
-		},
-		WaitForControl: func(address string) error {
-			return waitErr
-		},
-		IsProcessRunning: func(pid int) bool {
-			return pid == workerPID
-		},
-		StopProcess: func(pid int) error {
-			return nil
-		},
-	})
-
-	err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out)
-	if err == nil {
-		t.Fatal("expected worker startup error")
-	}
-	if !strings.Contains(err.Error(), "open serial port COM5: Serial port busy") {
-		t.Fatalf("error = %q, want worker retry error", err)
-	}
-	got, err := store.Load("dev1")
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if got.WorkerPID != 0 {
-		t.Fatalf("WorkerPID = %d, want 0", got.WorkerPID)
+	if got.Port != "COM5" || got.Baud != 3000000 || got.WorkerPID != 0 || got.ControlAddress != "" {
+		t.Fatalf("state = %#v", got)
 	}
 }
 

@@ -306,56 +306,15 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 				return err
 			}
 		}
-		controlAddress := ""
 		tcpAddress := ""
 		status := session.StatusConfigured
 		if hasOldState && oldState.TCPAddress != "" {
 			tcpAddress = oldState.TCPAddress
 			status = session.StatusTCP
-		} else if a.deps.ReserveControlAddress != nil {
-			var err error
-			controlAddress, err = a.deps.ReserveControlAddress()
-			if err != nil {
-				return err
-			}
 		}
-		state := session.State{Name: name, Port: port, Baud: baud, Status: status, TCPAddress: tcpAddress, ControlAddress: controlAddress}
+		state := session.State{Name: name, Port: port, Baud: baud, Status: status, TCPAddress: tcpAddress}
 		if err := a.deps.Store.Save(state); err != nil {
 			return err
-		}
-		if a.deps.StartWorker != nil {
-			pid, err := a.deps.StartWorker(name)
-			if err != nil {
-				return err
-			}
-			state, err = a.deps.Store.Load(name)
-			if err != nil {
-				return err
-			}
-			state.WorkerPID = pid
-			if err := a.deps.Store.Save(state); err != nil {
-				return err
-			}
-			if state.ControlAddress != "" && a.deps.WaitForControl != nil {
-				if err := a.deps.WaitForControl(state.ControlAddress); err != nil {
-					if startupErr := a.workerStartupErrorFromLog(name, pid, "session"); startupErr != nil {
-						if a.deps.StopProcess != nil && (a.deps.IsProcessRunning == nil || a.deps.IsProcessRunning(pid)) {
-							_ = a.deps.StopProcess(pid)
-						}
-						state.WorkerPID = 0
-						if saveErr := a.deps.Store.Save(state); saveErr != nil {
-							return errors.Join(startupErr, saveErr)
-						}
-						return startupErr
-					}
-					return err
-				}
-			}
-			if state.TCPAddress != "" && a.deps.IsProcessRunning != nil {
-				if err := a.waitForTCPWorkerStartup(name, pid); err != nil {
-					return err
-				}
-			}
 		}
 	}
 	_, _ = fmt.Fprintf(out, "session %s: %s at %d baud\n", name, port, baud)

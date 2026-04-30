@@ -1,0 +1,4 @@
+interface:
+  display_name: "Serial CLI"
+  short_description: "Operate serial devices with gs"
+  default_prompt: "Use $serial-cli to inspect ports, manage a named serial session, send or read data, and debug gs state."

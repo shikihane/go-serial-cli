@@ -1,0 +1,4 @@
+bin/
+dist/
+.tmp-skills/
+third_party_tools.local/

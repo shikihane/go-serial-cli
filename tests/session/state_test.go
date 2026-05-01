@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"go-serial-cli/internal/session"
@@ -30,8 +31,12 @@ func TestStoreSavesAndLoadsState(t *testing.T) {
 func TestStoreReportsMissingState(t *testing.T) {
 	store := session.Store{Dir: filepath.Join(t.TempDir(), "missing")}
 
-	if _, err := store.Load("dev1"); err == nil {
+	_, err := store.Load("dev1")
+	if err == nil {
 		t.Fatal("expected missing state error")
+	}
+	if got, want := err.Error(), "run sio open <session> <port> first"; !strings.Contains(got, want) {
+		t.Fatalf("missing state error = %q, want %q", got, want)
 	}
 }
 

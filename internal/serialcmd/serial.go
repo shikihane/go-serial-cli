@@ -17,6 +17,8 @@ import (
 	"go.bug.st/serial"
 )
 
+const shareEndpointWriteTimeout = 250 * time.Millisecond
+
 type StreamOptions struct {
 	Port      string
 	Baud      int
@@ -70,6 +72,7 @@ type ShareBridgeOptions struct {
 	TCPAddress     string
 	Stop           <-chan struct{}
 	OpenPort       func(port string, baud int) (SerialPort, error)
+	OnListening    func(address string)
 }
 
 func Ports() ([]string, error) {
@@ -417,7 +420,6 @@ func ShareBridge(opts ShareBridgeOptions) error {
 	}
 
 	bridge := newShareBridge(opts.PhysicalPort, physical, endpoints, output)
-	bridge.startHubWriters()
 	defer bridge.close()
 
 	var listeners []net.Listener
@@ -437,8 +439,14 @@ func ShareBridge(opts ShareBridgeOptions) error {
 		listeners = append(listeners, listener)
 		defer listener.Close()
 	}
+	if opts.OnListening != nil {
+		for _, listener := range listeners {
+			opts.OnListening(listener.Addr().String())
+		}
+	}
 
 	errCh := make(chan error, len(endpoints)+len(listeners)+2)
+	bridge.startHubWriters()
 	go func() {
 		errCh <- bridge.copyPhysicalToOutputs()
 	}()
@@ -586,7 +594,7 @@ func (b *shareBridge) startHubWriters() {
 		go func() {
 			defer b.asyncWG.Done()
 			for data := range endpoint.writes {
-				_, _ = endpoint.port.Write(data)
+				_ = writeSerialPortWithTimeout(endpoint.port, data, shareEndpointWriteTimeout)
 			}
 		}()
 	}

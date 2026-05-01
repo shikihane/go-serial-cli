@@ -145,9 +145,24 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"version: 1.2.3",
 		"commit=abc1234",
 		"built_at=2026-04-29T06:20:00Z",
-		"gs version",
-		"gs -v",
+		"sio version",
+		"sio -v",
 	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help output %q does not contain %q", got, want)
+		}
+	}
+}
+
+func TestHelpUsesConfiguredCommandName(t *testing.T) {
+	var out bytes.Buffer
+	app := cli.New(cli.AppDeps{CommandName: "gs"})
+
+	if err := app.Run([]string{"help"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"gs - serial CLI", "gs version", "gs skill install"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help output %q does not contain %q", got, want)
 		}
@@ -692,6 +707,36 @@ func TestShellRejectsPausedSession(t *testing.T) {
 	if !errors.Is(err, cli.ErrSessionPaused) {
 		t.Fatalf("error = %v, want ErrSessionPaused", err)
 	}
+	if !strings.Contains(err.Error(), "run sio resume first") {
+		t.Fatalf("error = %v, want sio resume guidance", err)
+	}
+}
+
+func TestPausedSessionErrorUsesConfiguredCommandName(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, Paused: true}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		CommandName: "gs",
+		Store:       store,
+		SendSerial: func(port string, baud int, data string) error {
+			t.Fatal("SendSerial should not be called")
+			return nil
+		},
+	})
+
+	err := app.Run([]string{"send", "dev1", "AT\\r\\n"}, &out)
+	if err == nil {
+		t.Fatal("expected paused session error")
+	}
+	if !errors.Is(err, cli.ErrSessionPaused) {
+		t.Fatalf("error = %v, want ErrSessionPaused", err)
+	}
+	if !strings.Contains(err.Error(), "run gs resume first") {
+		t.Fatalf("error = %v, want gs resume guidance", err)
+	}
 }
 
 func TestShellRequiresStreamImplementationWhenSessionExists(t *testing.T) {
@@ -862,7 +907,7 @@ func TestOpenStopsExistingLiveResourcesAndStartsSessionWorker(t *testing.T) {
 	}
 }
 
-func TestOpenReturnsWorkerStartupErrorAndClearsLiveState(t *testing.T) {
+func TestOpenReturnsWorkerStartupErrorAndRemovesNewSession(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	workerPID := 10565
@@ -898,12 +943,54 @@ func TestOpenReturnsWorkerStartupErrorAndClearsLiveState(t *testing.T) {
 	if !strings.Contains(err.Error(), "open serial port COM5: Serial port not found") {
 		t.Fatalf("error = %q, want worker retry error", err)
 	}
-	got, err := store.Load("dev1")
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
+	if _, err := store.Load("dev1"); err == nil {
+		t.Fatal("new failed open left a session behind")
 	}
-	if got.Port != "COM5" || got.Baud != 3000000 || got.WorkerPID != 0 || got.ControlAddress != "" || got.TCPAddress != "" {
-		t.Fatalf("state = %#v", got)
+}
+
+func TestOpenRestoresPreviousSessionWhenReplacementFails(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	previous := session.State{Name: "dev1", Port: "COM4", Baud: 9600, Status: session.StatusTCP, TCPAddress: ":7001", WorkerPID: 47017}
+	if err := store.Save(previous); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	workerPID := 10565
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		StopProcess: func(pid int) error {
+			return nil
+		},
+		IsProcessRunning: func(pid int) bool {
+			return pid == 47017 || pid == workerPID
+		},
+		ReserveControlAddress: func() (string, error) {
+			return "127.0.0.1:10565", nil
+		},
+		StartWorker: func(name string) (int, error) {
+			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=session pid=10565 control=127.0.0.1:10565"); err != nil {
+				t.Fatalf("AppendLog start returned error: %v", err)
+			}
+			if err := session.AppendLog(store.WorkerLogPath(name), "worker retry error=\"open serial port COM5: Serial port not found\" delay=250ms"); err != nil {
+				t.Fatalf("AppendLog retry returned error: %v", err)
+			}
+			return workerPID, nil
+		},
+		WaitForControl: func(address string) error {
+			return errors.New("wait for session control 127.0.0.1:10565: connection refused")
+		},
+	})
+
+	err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out)
+	if err == nil {
+		t.Fatal("expected worker startup error")
+	}
+	got, loadErr := store.Load("dev1")
+	if loadErr != nil {
+		t.Fatalf("Load returned error: %v", loadErr)
+	}
+	if !reflect.DeepEqual(got, previous) {
+		t.Fatalf("previous session was not restored: %#v", got)
 	}
 }
 
@@ -1514,6 +1601,32 @@ func TestShareReservesControlAddressForWorkerControl(t *testing.T) {
 	}
 }
 
+func TestShareReservesControlAddressForSingleVirtualPort(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		ReserveControlAddress: func() (string, error) {
+			return "127.0.0.1:7002", nil
+		},
+	})
+
+	if err := app.Run([]string{"share", "dev1", "COM20"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got, err := store.Load("dev1")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got.ControlAddress != "127.0.0.1:7002" {
+		t.Fatalf("ControlAddress = %q, want 127.0.0.1:7002", got.ControlAddress)
+	}
+}
+
 func TestShareCreatesVirtualPortPairsBeforeStartingWorker(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -1544,6 +1657,36 @@ func TestShareCreatesVirtualPortPairsBeforeStartingWorker(t *testing.T) {
 	}
 }
 
+func TestShareRecordsVirtualPortsBeforeCreationFailure(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		CreateVirtualPorts: func(pairs []cli.VirtualPortPair) error {
+			return errors.New("COM20 already exists")
+		},
+		StartWorker: func(name string) (int, error) {
+			t.Fatal("worker should not start when virtual port creation fails")
+			return 0, nil
+		},
+	})
+
+	err := app.Run([]string{"share", "dev1", "COM20"}, &out)
+	if err == nil {
+		t.Fatal("expected virtual port creation error")
+	}
+	got, loadErr := store.Load("dev1")
+	if loadErr != nil {
+		t.Fatalf("Load returned error: %v", loadErr)
+	}
+	if got.Status != session.StatusSharing || !reflect.DeepEqual(got.VirtualPorts, []string{"COM20"}) || !reflect.DeepEqual(got.HubPorts, []string{"CNCB20"}) {
+		t.Fatalf("state did not retain failed share resources: %#v", got)
+	}
+}
+
 func TestAdminSetupCRunsSetupCAndPauses(t *testing.T) {
 	var out bytes.Buffer
 	var gotArgs []string
@@ -1559,10 +1702,10 @@ func TestAdminSetupCRunsSetupCAndPauses(t *testing.T) {
 		},
 	})
 
-	if err := app.Run([]string{"admin", "setupc", "install", "20", "PortName=COM20", "-"}, &out); err != nil {
+	if err := app.Run([]string{"admin", "setupc", "remove", "20"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if !reflect.DeepEqual(gotArgs, []string{"install", "20", "PortName=COM20", "-"}) {
+	if !reflect.DeepEqual(gotArgs, []string{"remove", "20"}) {
 		t.Fatalf("setupc args = %#v", gotArgs)
 	}
 	if !paused {
@@ -1793,6 +1936,10 @@ func TestWorkerAutoKeepsSharedSessionWhenTCPAddressIsSet(t *testing.T) {
 			if opts.ControlAddress != ":7001" {
 				t.Fatalf("ControlAddress = %q, want :7001", opts.ControlAddress)
 			}
+			if opts.OnListening == nil {
+				t.Fatal("OnListening is nil")
+			}
+			opts.OnListening(":7001")
 			return nil
 		},
 		BridgeTCP: func(opts serialcmd.TCPBridgeOptions) error {
@@ -1806,6 +1953,13 @@ func TestWorkerAutoKeepsSharedSessionWhenTCPAddressIsSet(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("RunShareBridge was not called")
+	}
+	data, err := os.ReadFile(store.WorkerLogPath("dev1"))
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if got := string(data); !strings.Contains(got, "worker ready listen=:7001") {
+		t.Fatalf("worker log %q does not contain ready listen", got)
 	}
 }
 
@@ -2111,7 +2265,7 @@ func TestTCPPreservesShareResources(t *testing.T) {
 	}
 }
 
-func TestShareClearsTCPAddress(t *testing.T) {
+func TestSharePreservesTCPAddress(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -2141,8 +2295,8 @@ func TestShareClearsTCPAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.TCPAddress != "" {
-		t.Fatalf("TCPAddress = %q, want empty", got.TCPAddress)
+	if got.Status != session.StatusSharing || got.TCPAddress != ":7001" {
+		t.Fatalf("state = %#v, want sharing with existing TCPAddress", got)
 	}
 }
 
@@ -2605,7 +2759,7 @@ func TestStopSkipsAlreadyGoneProcessesAndStillClearsState(t *testing.T) {
 	}
 }
 
-func TestStopKeepsSessionResourcesWhenVirtualPortRemovalFails(t *testing.T) {
+func TestStopRetainsVirtualPortsWhenRemovalFails(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -2631,19 +2785,115 @@ func TestStopKeepsSessionResourcesWhenVirtualPortRemovalFails(t *testing.T) {
 		},
 	})
 
-	err := app.Run([]string{"stop", "dev1"}, &out)
-	if !errors.Is(err, removeErr) {
-		t.Fatalf("Run error = %v, want %v", err, removeErr)
+	if err := app.Run([]string{"stop", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 	got, loadErr := store.Load("dev1")
 	if loadErr != nil {
 		t.Fatalf("Load returned error: %v", loadErr)
 	}
-	if got.Status != session.StatusSharing || got.WorkerPID != 111 || got.HubPID != 112 || len(got.VirtualPorts) != 1 || got.VirtualPorts[0] != "COM20" {
-		t.Fatalf("state was cleared despite cleanup failure: %#v", got)
+	if got.Status != session.StatusStopped || got.WorkerPID != 0 || got.HubPID != 0 {
+		t.Fatalf("live state was not cleared despite cleanup failure: %#v", got)
 	}
-	if strings.Contains(out.String(), "stopped dev1") {
-		t.Fatalf("output = %q, should not report stopped on cleanup failure", out.String())
+	if !reflect.DeepEqual(got.VirtualPorts, []string{"COM20"}) || !reflect.DeepEqual(got.HubPorts, []string{"CNCB20"}) {
+		t.Fatalf("virtual ports were not retained for retry: %#v", got)
+	}
+	if !strings.Contains(out.String(), "warning: cleanup for dev1 was incomplete") || !strings.Contains(out.String(), "stopped dev1") {
+		t.Fatalf("output = %q, want warning and stopped message", out.String())
+	}
+}
+
+func TestRMRetainsSessionWhenVirtualPortRemovalFails(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{
+		Name:         "dev1",
+		Port:         "COM3",
+		Baud:         115200,
+		Status:       session.StatusSharing,
+		WorkerPID:    111,
+		HubPID:       112,
+		VirtualPorts: []string{"COM20"},
+		HubPorts:     []string{"CNCB20"},
+	}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	removeErr := errors.New("COM20 is in use")
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		StopProcess: func(pid int) error {
+			return nil
+		},
+		RemoveVirtualPorts: func(pairs []cli.VirtualPortPair) error {
+			return removeErr
+		},
+	})
+
+	if err := app.Run([]string{"rm", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	got, loadErr := store.Load("dev1")
+	if loadErr != nil {
+		t.Fatalf("Load returned error: %v", loadErr)
+	}
+	if got.Status != session.StatusStopped || !reflect.DeepEqual(got.VirtualPorts, []string{"COM20"}) || !reflect.DeepEqual(got.HubPorts, []string{"CNCB20"}) {
+		t.Fatalf("session did not retain failed cleanup state: %#v", got)
+	}
+	if !strings.Contains(out.String(), "warning: cleanup for dev1 was incomplete") || !strings.Contains(out.String(), "not removed") {
+		t.Fatalf("output = %q, want warning and not removed message", out.String())
+	}
+}
+
+func TestClearShareStopsShareSessionsAndClearsGlobalPorts(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	for _, state := range []session.State{
+		{Name: "dev1", Port: "COM3", Baud: 115200, Status: session.StatusSharing, WorkerPID: 111, VirtualPorts: []string{"COM20"}, HubPorts: []string{"CNCB20"}},
+		{Name: "dev2", Port: "COM4", Baud: 9600, Status: session.StatusTCP, WorkerPID: 222, TCPAddress: ":7001"},
+	} {
+		if err := store.Save(state); err != nil {
+			t.Fatalf("Save returned error: %v", err)
+		}
+	}
+	var stopped []int
+	cleared := false
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		StopProcess: func(pid int) error {
+			stopped = append(stopped, pid)
+			return nil
+		},
+		ClearSharePorts: func() error {
+			cleared = true
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"clear", "--share"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !reflect.DeepEqual(stopped, []int{111}) {
+		t.Fatalf("stopped PIDs = %#v, want []int{111}", stopped)
+	}
+	if !cleared {
+		t.Fatal("ClearSharePorts was not called")
+	}
+	dev1, err := store.Load("dev1")
+	if err != nil {
+		t.Fatalf("Load(dev1) returned error: %v", err)
+	}
+	dev2, err := store.Load("dev2")
+	if err != nil {
+		t.Fatalf("Load(dev2) returned error: %v", err)
+	}
+	if dev1.Status != session.StatusStopped || len(dev1.VirtualPorts) != 0 || dev1.WorkerPID != 0 {
+		t.Fatalf("dev1 was not cleared: %#v", dev1)
+	}
+	if dev2.Status != session.StatusTCP || dev2.WorkerPID != 222 {
+		t.Fatalf("dev2 should not be touched: %#v", dev2)
+	}
+	if !strings.Contains(out.String(), "shared virtual ports cleared") {
+		t.Fatalf("output = %q, want clear confirmation", out.String())
 	}
 }
 

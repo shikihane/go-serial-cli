@@ -73,7 +73,7 @@ func (s Store) Load(name string) (State, error) {
 	}
 	data, err := os.ReadFile(s.path(name))
 	if err != nil {
-		return State{}, errors.New("no serial session named " + name + "; run gs open <session> <port> first")
+		return State{}, errors.New("no serial session named " + name + "; run sio open <session> <port> first")
 	}
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {

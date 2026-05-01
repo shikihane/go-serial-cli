@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-`gs` is a small Go CLI for working with serial ports on Windows. It is meant for
+`sio` is a small Go CLI for working with serial ports on Windows. It is meant for
 real debug benches: industrial PCs, vendor tools, upper-computer apps, firmware
 flashing, and the cases where a human and an agent both need to work with the
 same device.
@@ -13,33 +13,33 @@ state and logs, and cleanup that only touches the session you named.
 ## Quick start
 
 ```bash
-gs version
-gs ports
-gs open dev1 COM3 -b 115200
-gs send dev1 "AT\r\n"
-gs ask dev1 "AT\r\n"
-gs read dev1 -n 200
-gs check dev1 -n 200
-gs stop dev1
+sio version
+sio ports
+sio open dev1 COM3 -b 115200
+sio send dev1 "AT\r\n"
+sio ask dev1 "AT\r\n"
+sio read dev1 -n 200
+sio check dev1 -n 200
+sio stop dev1
 ```
 
-`gs open` records a named session and starts a background worker that keeps the
+`sio open` records a named session and starts a background worker that keeps the
 physical port open, reads serial output, and appends it to `cache.log`.
 Commands such as `send`, `ask`, `read`, `check`, and `shell` coordinate through
 that named session.
 
 ```bash
-gs shell dev1
-gs tee dev1 serial.log
-gs tcp dev1 :7001
-gs share dev1 COM20 COM21
+sio shell dev1
+sio tee dev1 serial.log
+sio tcp dev1 :7001
+sio share dev1 COM20 COM21
 ```
 
 Clean up only the session you named:
 
 ```bash
-gs stop dev1
-gs rm dev1
+sio stop dev1
+sio rm dev1
 ```
 
 `stop` releases live resources and leaves the session files. `rm` performs the
@@ -47,18 +47,33 @@ same live cleanup, then deletes that session's state, cache, and logs.
 
 ## Why Windows first
 
-Most industrial PCs, factory test stations, embedded benches, and vendor debug
-tools still run on Windows. Linux and macOS already have good terminal tools for
-this kind of work. On Windows, serial work is often split across GUI tools,
-vendor utilities, virtual COM drivers, and small scripts.
+The main pain is on Windows, not because serial ports only exist there, but
+because real upper-computer debugging usually lands there. Industrial PCs,
+factory test stations, firmware flashing tools, vendor GUI utilities, USB
+drivers, and device manuals are commonly written for Windows first. When a
+hardware supplier gives you a debug program, it is much more likely to expect a
+Windows COM port than a Unix device file.
 
-`gs` starts there. Serial enumeration, console input, process cleanup, com0com
-sharing, logs, and manual intervention need to work well on a real Windows
-machine before the project spends much time on other platforms.
+Linux and macOS already have a more flexible file I/O model for this kind of
+work. A serial device is just another file-like endpoint, and tools such as
+`nc`, `ncat`, `socat`, shell pipes, `tee`, redirection, and background jobs can
+be combined into workflows that cover much of what this project does.
+
+Windows does not have that same default toolbox for serial benches. COM ports
+are usually handled through GUI terminals, vendor upper-computer apps, virtual
+COM drivers, and one-off scripts. Sharing one physical port between a human, an
+agent, a vendor tool, and a remote process is awkward; logs often live in a GUI
+scrollback; cleanup is easy to get wrong.
+
+`sio` starts there. The project exists to make those Windows workflows boring:
+enumerate ports, keep a named session open, send exact bytes, cache output,
+inspect logs, share through com0com, expose TCP, and clean up only the session
+you named. Linux support should remain possible, but the core product value is
+solving the Windows bench pain first.
 
 ## Who uses it
 
-Use `gs` when you need to:
+Use `sio` when you need to:
 
 - list local serial ports.
 - name a device once, then send/read/check it repeatedly.
@@ -75,18 +90,18 @@ take priority.
 
 ## Collaboration model
 
-`gs` is not just an agent helper. A common hardware bench has several things
+`sio` is not just an agent helper. A common hardware bench has several things
 looking at the same serial device: a human, an agent, a vendor upper-computer
 program, and sometimes a remote process.
 
 A typical setup might look like this:
 
-- an agent uses the installed skill to call `gs send`, `gs check`, `gs read`,
-  `gs status`, and `gs log`.
-- a human opens `gs shell dev1` when the device needs manual recovery.
+- an agent uses the installed skill to call `sio send`, `sio check`, `sio read`,
+  `sio status`, and `sio log`.
+- a human opens `sio shell dev1` when the device needs manual recovery.
 - an upper-computer application connects through virtual COM ports created by
-  `gs share dev1 COM20 COM21`.
-- a remote process connects through `gs tcp dev1 :7001`.
+  `sio share dev1 COM20 COM21`.
+- a remote process connects through `sio tcp dev1 :7001`.
 - everyone can inspect the same cache and logs instead of depending on one
   terminal's scrollback.
 
@@ -102,45 +117,45 @@ operators around it. Without a small coordinating tool, people usually end up
 fighting over the COM port, losing terminal output, or asking someone else to
 copy logs from a GUI window.
 
-With `gs`, the physical port is named once:
+With `sio`, the physical port is named once:
 
 ```powershell
-gs open dev1 COM3 -b 115200
+sio open dev1 COM3 -b 115200
 ```
 
 Then different tools can attach in different ways:
 
-- the AI agent reads logs with `gs check dev1` and sends exact bytes with
-  `gs send dev1 "AT\r\n"`.
-- the human opens `gs shell dev1` when manual judgment is needed.
+- the AI agent reads logs with `sio check dev1` and sends exact bytes with
+  `sio send dev1 "AT\r\n"`.
+- the human opens `sio shell dev1` when manual judgment is needed.
 - the upper-computer app connects to a virtual COM port created by
-  `gs share dev1 COM20 COM21`.
-- a remote coworker or machine connects through `gs tcp dev1 :7001`.
+  `sio share dev1 COM20 COM21`.
+- a remote coworker or machine connects through `sio tcp dev1 :7001`.
 - everyone can inspect `cache.log` and `worker.log`.
 
 ```mermaid
 flowchart LR
     device["Industrial device\nphysical serial port COM3"]
-    gs["gs session dev1\nopen/read/check/send\ncache + logs"]
+    sio["sio session dev1\nopen/read/check/send\ncache + logs"]
     cache["session files\nstate.json\ncache.log\nworker.log"]
 
     agent["AI agent\nserial-cli skill\ncheck/read/send/status/log"]
-    human["Human operator\ngs shell dev1"]
+    human["Human operator\nsio shell dev1"]
     upper["Upper-computer app\nvirtual COM20/COM21"]
     remote["Remote coworker or machine\nTCP :7001"]
 
-    device <--> gs
-    gs <--> agent
-    gs <--> human
-    gs <--> upper
-    gs <--> remote
-    gs --> cache
+    device <--> sio
+    sio <--> agent
+    sio <--> human
+    sio <--> upper
+    sio <--> remote
+    sio --> cache
     agent -.inspect.-> cache
     human -.inspect.-> cache
 ```
 
 The exact ownership still matters. A command should say which session it is
-touching, and `gs stop dev1` should only clean up `dev1`. That is what makes this
+touching, and `sio stop dev1` should only clean up `dev1`. That is what makes this
 safe enough for a bench where a human, an agent, and a vendor tool are all active
 at the same time.
 
@@ -148,35 +163,35 @@ at the same time.
 
 The other common case is using an AI agent to drive firmware or device-side
 development. The agent can build code, flash a board, send serial commands, read
-boot logs, and summarize failures. `gs` gives the agent a small and repeatable
+boot logs, and summarize failures. `sio` gives the agent a small and repeatable
 serial interface instead of asking it to operate a GUI terminal.
 
 The human is still in the loop:
 
 - read the same cached output the agent reads.
-- interrupt with `gs shell dev1` when the device needs a manual recovery step.
-- use `gs pause dev1` before a flash or burn step that needs exclusive access.
-- inspect `gs status dev1` and `gs log dev1` when the agent reports a failure.
+- interrupt with `sio shell dev1` when the device needs a manual recovery step.
+- use `sio pause dev1` before a flash or burn step that needs exclusive access.
+- inspect `sio status dev1` and `sio log dev1` when the agent reports a failure.
 - modify the session with normal CLI commands instead of editing hidden state.
 
 ```mermaid
 sequenceDiagram
     participant Dev as Human developer
     participant Agent as AI agent + serial-cli skill
-    participant GS as gs session dev1
+    participant sio as sio session dev1
     participant DUT as Device under test
 
     Dev->>Agent: Ask it to build, flash, and diagnose
-    Agent->>GS: gs status dev1
-    Agent->>GS: gs send dev1 "AT\\r\\n"
-    GS->>DUT: Write bytes to COM3
-    DUT-->>GS: Boot logs / command output
-    Agent->>GS: gs check dev1 -n 4000
-    GS-->>Agent: New cached output
-    Dev->>GS: gs read dev1 -n 4000
-    Dev->>GS: gs shell dev1
+    Agent->>sio: sio status dev1
+    Agent->>sio: sio send dev1 "AT\\r\\n"
+    sio->>DUT: Write bytes to COM3
+    DUT-->>sio: Boot logs / command output
+    Agent->>sio: sio check dev1 -n 4000
+    sio-->>Agent: New cached output
+    Dev->>sio: sio read dev1 -n 4000
+    Dev->>sio: sio shell dev1
     Dev->>DUT: Manual recovery command
-    Agent->>GS: gs log dev1
+    Agent->>sio: sio log dev1
 ```
 
 This is the operating model the skill is meant to support: agent-driven, but not
@@ -184,21 +199,21 @@ agent-only. The human can observe, interrupt, and change course at any point.
 
 ## Not goals right now
 
-`gs` is not a daemon-based serial service yet. Background workers exist for
+`sio` is not a daemon-based serial service yet. Background workers exist for
 long-running modes such as `tcp`, `share`, and session control, but normal usage
 should still look like a short CLI:
 
 ```bash
-gs open dev1 COM3 -b 115200
-gs send dev1 "AT\r\n"
-gs check dev1 -n 200
-gs stop dev1
+sio open dev1 COM3 -b 115200
+sio send dev1 "AT\r\n"
+sio check dev1 -n 200
+sio stop dev1
 ```
 
 Remote skill registries, plugin execution, dependency management, and automatic
 driver installation can wait. The basic commands need to be reliable first.
 
-## Install gs
+## Install sio
 
 There is no package manager or installer flow yet. For now, install from source.
 
@@ -211,33 +226,33 @@ From the repository root:
 
 ```powershell
 go test ./...
-go install ./cmd/gs
+go install ./cmd/sio
 ```
 
 On Windows, if `GOBIN` is unset, Go installs the binary under:
 
 ```text
-%GOPATH%\bin\gs.exe
+%GOPATH%\bin\sio.exe
 ```
 
 For the default Go setup this is usually:
 
 ```text
-C:\Users\<you>\go\bin\gs.exe
+C:\Users\<you>\go\bin\sio.exe
 ```
 
 Make sure that directory is on `PATH`, then check which binary will run:
 
 ```powershell
-Get-Command gs
-gs version
+Get-Command sio
+sio version
 ```
 
 If you only want a local build without installing to `PATH`:
 
 ```powershell
-go build -o bin/gs.exe ./cmd/gs
-.\bin\gs.exe version
+go build -o bin/sio.exe ./cmd/sio
+.\bin\sio.exe version
 ```
 
 For development builds with version metadata:
@@ -246,8 +261,23 @@ For development builds with version metadata:
 $commit = git rev-parse --short HEAD
 if (git status --porcelain) { $commit = "$commit-dirty" }
 $builtAt = Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"
-go install -ldflags "-X go-serial-cli/internal/cli.BuildVersion=dev -X go-serial-cli/internal/cli.BuildCommit=$commit -X go-serial-cli/internal/cli.BuildBuiltAt=$builtAt" ./cmd/gs
+go install -ldflags "-X go-serial-cli/internal/cli.BuildVersion=dev -X go-serial-cli/internal/cli.BuildCommit=$commit -X go-serial-cli/internal/cli.BuildBuiltAt=$builtAt" ./cmd/sio
 ```
+
+### Compatibility alias
+
+`sio` is the canonical command for new docs, scripts, and agent instructions.
+The repository still builds `gs` as a short legacy alias during the transition:
+
+```powershell
+go install ./cmd/gs
+Get-Command gs
+gs version
+```
+
+Both binaries use the same session state. Existing session files remain under
+`%AppData%/gs`; this migration does not rename the user data directory.
+See [docs/sio-rename.md](docs/sio-rename.md) for the migration note.
 
 ## Dependencies
 
@@ -260,10 +290,10 @@ Build-time Go modules are downloaded by the Go toolchain:
 Runtime dependencies depend on what you use:
 
 - Basic commands such as `version`, `ports`, `open`, `send`, `read`, `check`,
-  `shell`, `tee`, `tcp`, `status`, and `log` need only `gs.exe`.
-- `gs share` needs com0com installed on Windows, with `setupc.exe` available on
+  `shell`, `tee`, `tcp`, `status`, and `log` need only `sio.exe`.
+- `sio share` needs com0com installed on Windows, with `setupc.exe` available on
   `PATH` or in a standard Program Files install location.
-- The `gs share` worker uses the Go bridge built into `gs` after com0com
+- The `sio share` worker uses the Go bridge built into `sio` after com0com
   creates the virtual COM pairs.
 
 Download com0com from:
@@ -273,7 +303,7 @@ com0com project site: https://com0com.com/
 com0com SourceForge project: https://sourceforge.net/projects/com0com/
 ```
 
-Install the driver manually. `gs` should not silently install kernel drivers.
+Install the driver manually. `sio` should not silently install kernel drivers.
 This repository does not vendor or redistribute com0com installers.
 
 ## Command model
@@ -281,12 +311,12 @@ This repository does not vendor or redistribute com0com installers.
 ### Discovery and setup
 
 ```bash
-gs version
-gs -v
-gs ports
-gs open dev1 COM3 -b 115200
-gs list
-gs status dev1
+sio version
+sio -v
+sio ports
+sio open dev1 COM3 -b 115200
+sio list
+sio status dev1
 ```
 
 Sessions are named so multiple devices, terminals, or agents do not accidentally
@@ -296,13 +326,13 @@ named session, never on every session as a side effect.
 ### Sending bytes
 
 ```bash
-gs send dev1 "AT\r\n"
-gs send dev1 "\x03"
-gs send dev1 "\cC"
-gs send dev1 "\x1b"
-gs send dev1 "\x04"
-gs ask dev1 "AT\r\n"
-gs ask dev1 "ATI\r\n" -t 1.5 -l 5
+sio send dev1 "AT\r\n"
+sio send dev1 "\x03"
+sio send dev1 "\cC"
+sio send dev1 "\x1b"
+sio send dev1 "\x04"
+sio ask dev1 "AT\r\n"
+sio ask dev1 "ATI\r\n" -t 1.5 -l 5
 ```
 
 Payloads support explicit escapes:
@@ -318,7 +348,7 @@ Payloads support explicit escapes:
 Bare forms such as `^C` are ordinary text. This keeps literal payloads
 unambiguous.
 
-`gs ask` sends one payload, then reads fresh serial response data for a short
+`sio ask` sends one payload, then reads fresh serial response data for a short
 window. The default window is 0.5 seconds and the default output is the last 50
 response lines. Use `-t <seconds>` to change the window and `-l <lines>` to
 print the last N lines. `-l 0` disables the line limit.
@@ -326,19 +356,19 @@ print the last N lines. `-l 0` disables the line limit.
 ### Reading cached output
 
 ```bash
-gs read dev1 -n 200
-gs read dev1 --to serial-cache.log
-gs read dev1 -n 4096 --to recent.log
-gs check dev1 -n 200
-gs check dev1 --rewind 2000
-gs check dev1 --from 0 --to checked.log
-gs clear dev1
+sio read dev1 -n 200
+sio read dev1 --to serial-cache.log
+sio read dev1 -n 4096 --to recent.log
+sio check dev1 -n 200
+sio check dev1 --rewind 2000
+sio check dev1 --from 0 --to checked.log
+sio clear dev1
 ```
 
-`gs read` is non-destructive. It views `cache.log` and never advances a cursor,
+`sio read` is non-destructive. It views `cache.log` and never advances a cursor,
 consumes bytes, or truncates the cache.
 
-`gs check` is incremental. It reads from the saved check cursor and advances that
+`sio check` is incremental. It reads from the saved check cursor and advances that
 cursor only to the bytes it emitted. Use `--rewind <bytes>` to back up from the
 saved cursor, or `--from <offset>` to inspect from an absolute cache offset.
 
@@ -348,38 +378,38 @@ of dumping it to the terminal.
 ### Live owners
 
 ```bash
-gs shell dev1
-gs tee dev1 serial.log
-gs tcp dev1 :7001
-gs share dev1 COM20 COM21
+sio shell dev1
+sio tee dev1 serial.log
+sio tcp dev1 :7001
+sio share dev1 COM20 COM21
 ```
 
-`gs shell` connects to the running named session in the foreground, prints serial
+`sio shell` connects to the running named session in the foreground, prints serial
 output, and writes stdin to the port. Exiting shell leaves the background worker
 running. Use escaped line endings such as `AT\r\n` when the device expects CRLF.
 On Windows, one Ctrl+C sends byte `0x03` to the device; a second interrupt
 shortly after exits the shell.
 
-`gs tee` keeps the port open in the foreground and writes serial output to the
+`sio tee` keeps the port open in the foreground and writes serial output to the
 terminal, the requested file, and the session cache.
 
-`gs tcp` starts a background worker that accepts TCP clients and bridges them to
+`sio tcp` starts a background worker that accepts TCP clients and bridges them to
 the named serial session.
 
-`gs share` uses com0com plus the built-in Go byte bridge to share the named
+`sio share` uses com0com plus the built-in Go byte bridge to share the named
 physical serial session through virtual COM ports. Driver installation remains
-explicit; `gs` should fail with an actionable error if com0com's `setupc.exe`
+explicit; `sio` should fail with an actionable error if com0com's `setupc.exe`
 is not available.
 
 ### Lifecycle and diagnostics
 
 ```bash
-gs pause dev1
-gs resume dev1
-gs status dev1
-gs log dev1
-gs stop dev1
-gs rm dev1
+sio pause dev1
+sio resume dev1
+sio status dev1
+sio log dev1
+sio stop dev1
+sio rm dev1
 ```
 
 `pause` and `resume` update local session state for workflows that need temporary
@@ -387,7 +417,7 @@ exclusive access, such as burn or flash steps.
 
 `status` reports saved resources and PID liveness as `running`, `stale`, or
 `stopped`. `stale` means a PID is saved in state but the matching process no
-longer appears to be running. `gs stop dev1` should still be safe and should
+longer appears to be running. `sio stop dev1` should still be safe and should
 clean only `dev1`.
 
 ## Design goals
@@ -397,8 +427,8 @@ clean only `dev1`.
 Commands should describe the user's job, not the internal architecture. Prefer:
 
 ```bash
-gs open dev1 COM3
-gs tcp dev1 :7001
+sio open dev1 COM3
+sio tcp dev1 :7001
 ```
 
 over exposing words such as `session`, `forward`, `supervisor`, or `backend` in
@@ -406,13 +436,13 @@ normal workflows.
 
 ### Make bytes explicit
 
-Serial debugging often depends on exact bytes. `gs` should make CRLF, Ctrl+C,
+Serial debugging often depends on exact bytes. `sio` should make CRLF, Ctrl+C,
 ESC, Ctrl+D, and other control bytes explicit through escapes instead of
 guessing what a shorthand might mean.
 
 ### Treat sessions as isolation boundaries
 
-A session name is a safety boundary. `gs stop dev1` and `gs rm dev1` must not
+A session name is a safety boundary. `sio stop dev1` and `sio rm dev1` must not
 stop another session, remove another device's virtual ports, or delete unrelated
 logs. This matters when multiple agents or humans are controlling different
 devices on the same Windows machine.
@@ -428,7 +458,7 @@ right workflow.
 
 Industrial debugging often has more than one observer. A vendor upper-computer
 tool, an agent, a human shell, and a remote process may all need to work around
-the same physical port. `gs tcp`, `gs share`, cache files, and logs are the
+the same physical port. `sio tcp`, `sio share`, cache files, and logs are the
 pieces that make that possible.
 
 ### Prefer inspectable local state
@@ -439,7 +469,7 @@ a daemon that may or may not be running.
 
 ### Keep driver installation explicit
 
-Creating virtual COM pairs requires system-level drivers. `gs share` uses
+Creating virtual COM pairs requires system-level drivers. `sio share` uses
 com0com for those pairs, but it should not silently install drivers. Missing
 prerequisites should produce clear setup guidance.
 
@@ -450,17 +480,17 @@ down before a daemon or backend process is added.
 
 ## System architecture
 
-`gs` is a CLI first. The user runs commands, and those commands read or update a
+`sio` is a CLI first. The user runs commands, and those commands read or update a
 named session directory under the user config path. Some modes start a background
-`gs worker`, but that worker is still the same binary. There is no separate
+`sio worker`, but that worker is still the same binary. There is no separate
 daemon to install or manage.
 
 ```mermaid
 flowchart TB
     user["Human / agent / script"]
-    cli["gs.exe CLI\nversion ports open send read check shell tee tcp share status log stop rm"]
+    cli["sio.exe CLI\nversion ports open send read check shell tee tcp share status log stop rm"]
     store["Session directory\n%AppData%/gs/sessions/dev1\nstate.json cache.log worker.log"]
-    worker["gs worker\nsame binary\nsession / tcp / share"]
+    worker["sio worker\nsame binary\nsession / tcp / share"]
     serial["go.bug.st/serial\nCOM3"]
     device["Device under test"]
     tcp["TCP clients\n:7001"]
@@ -481,20 +511,20 @@ flowchart TB
 
 The simple commands are short-lived:
 
-- `gs ports` asks `go.bug.st/serial` for available ports.
-- `gs open dev1 COM3 -b 115200` writes `state.json`, starts a background
+- `sio ports` asks `go.bug.st/serial` for available ports.
+- `sio open dev1 COM3 -b 115200` writes `state.json`, starts a background
   session worker, and keeps the configured port open until `stop` or `rm`.
-- `gs send dev1 ...` sends bytes through the session worker when it is running.
-- `gs ask dev1 ...` sends bytes through the session worker when it is running,
+- `sio send dev1 ...` sends bytes through the session worker when it is running.
+- `sio ask dev1 ...` sends bytes through the session worker when it is running,
   then reads a short response window from newly cached output.
-- `gs read` and `gs check` read `cache.log`.
+- `sio read` and `sio check` read `cache.log`.
 
 The live modes keep something open:
 
-- `gs shell` and `gs tee` run in the foreground.
-- `gs tcp` records a TCP address and starts a worker that bridges TCP clients to
+- `sio shell` and `sio tee` run in the foreground.
+- `sio tcp` records a TCP address and starts a worker that bridges TCP clients to
   the serial port.
-- `gs share` creates virtual COM pairs with com0com and starts a worker that
+- `sio share` creates virtual COM pairs with com0com and starts a worker that
   runs the built-in Go byte bridge.
 
 The cache is the shared observation point. Workers and foreground readers append
@@ -506,7 +536,7 @@ The code is split so command parsing, serial I/O, session files, and helper tool
 logic stay separate.
 
 ```text
-cmd/gs/                 executable entrypoint
+cmd/sio/                 executable entrypoint
 internal/cli/           command parsing and command behavior
 internal/serialcmd/     serial I/O, streaming, TCP bridge, session server
 internal/session/       state.json, cache.log, check cursor, log paths
@@ -521,7 +551,7 @@ The main dependency direction is:
 
 ```mermaid
 flowchart LR
-    main["cmd/gs"] --> cli["internal/cli"]
+    main["cmd/sio"] --> cli["internal/cli"]
     cli --> session["internal/session"]
     cli --> serialcmd["internal/serialcmd"]
     cli --> worker["internal/worker"]
@@ -558,6 +588,9 @@ On Windows, session files live under:
 %AppData%/gs/sessions/<session>/
 ```
 
+This path intentionally keeps the old `gs` directory name so existing sessions
+continue to work with both `sio` and the legacy `gs` alias.
+
 Important files:
 
 ```text
@@ -566,17 +599,17 @@ cache.log
 worker.log
 ```
 
-Use `gs log <session>` for `worker.log` when diagnosing sessions and share
+Use `sio log <session>` for `worker.log` when diagnosing sessions and share
 workers.
 
 When `worker_state` is `stopped`, nothing is appending fresh serial output in
 the background. `read` and `check` can still inspect old cached bytes, but they
-are not live device reads. Run `gs open <session> <port> -b <baud>` to restart
+are not live device reads. Run `sio open <session> <port> -b <baud>` to restart
 the session worker.
 
 ## Windows setup
 
-Install com0com manually before using `gs share`:
+Install com0com manually before using `sio share`:
 
 ```text
 com0com project site: https://com0com.com/
@@ -586,19 +619,19 @@ com0com SourceForge project: https://sourceforge.net/projects/com0com/
 After installing com0com, make sure `setupc.exe` is on `PATH`, or installed in a
 standard com0com location under `Program Files`.
 
-The `gs share` path uses the Go bridge built into `gs`, after com0com has
-created the virtual COM pairs. `gs` does not bundle or extract third-party
+The `sio share` path uses the Go bridge built into `sio`, after com0com has
+created the virtual COM pairs. `sio` does not bundle or extract third-party
 executables.
 
 ## Skill installation
 
-`gs` can install the bundled `serial-cli` skill for agent context:
+`sio` can install the bundled `serial-cli` skill for agent context:
 
 ```bash
-gs skill install
-gs skill install --to codex
-gs skill install --to claude
-gs skill install --to ./.tmp-skills
+sio skill install
+sio skill install --to codex
+sio skill install --to claude
+sio skill install --to ./.tmp-skills
 ```
 
 Default install targets both:
@@ -633,7 +666,7 @@ for agent instructions, not a runtime plugin system.
 
 ### 3. Polish installation and agent workflows
 
-- keep `gs skill install` minimal and dependency-free.
+- keep `sio skill install` minimal and dependency-free.
 - document the manual Windows checks needed before asking a human to test
   hardware behavior.
 - keep the installed skill aligned with the CLI's actual command shape.
@@ -642,17 +675,21 @@ for agent instructions, not a runtime plugin system.
 
 ```bash
 go test ./...
+go build -o bin/sio.exe ./cmd/sio
 go build -o bin/gs.exe ./cmd/gs
 ```
 
 Useful safe command checks on Windows:
 
 ```bash
-go run ./cmd/gs version
-go run ./cmd/gs help
-go run ./cmd/gs ports
-go run ./cmd/gs skill install --to ./.tmp-skills
+go run ./cmd/sio version
+go run ./cmd/sio help
+go run ./cmd/sio ports
+go run ./cmd/sio skill install --to ./.tmp-skills
 ```
+
+The `cmd/gs` entrypoint is kept as a compatibility alias. New usage should
+prefer `cmd/sio`.
 
 Remove `.tmp-skills` after manual install tests.
 
@@ -660,8 +697,8 @@ Before asking someone to manually test a CLI change, install the binary and
 verify the active command:
 
 ```powershell
-Get-Command gs
-gs version
+Get-Command sio
+sio version
 ```
 
 Do not commit build artifacts or temporary install outputs:
@@ -676,19 +713,19 @@ dist/
 
 | Symptom | First checks |
 | --- | --- |
-| Port missing | Run `gs ports`; verify Windows Device Manager; avoid assuming COM names. |
-| `Access is denied` or busy port | Check `gs status <session>`, stop only the owning named session, and close other terminals/tools. |
-| No output from `read` or `check` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` to restart the session worker. If stale, run `gs stop <session>` and reopen it. |
-| Missed output with `check` | Use `gs check <session> --rewind <bytes>` or `--from <offset>`. |
-| Worker startup failed | Read `worker.log`; `gs status` may surface `worker_error`. |
+| Port missing | Run `sio ports`; verify Windows Device Manager; avoid assuming COM names. |
+| `Access is denied` or busy port | Check `sio status <session>`, stop only the owning named session, and close other terminals/tools. |
+| No output from `read` or `check` | Run `sio status <session>`; if stopped, run `sio open <session> <port> -b <baud>` to restart the session worker. If stale, run `sio stop <session>` and reopen it. |
+| Missed output with `check` | Use `sio check <session> --rewind <bytes>` or `--from <offset>`. |
+| Worker startup failed | Read `worker.log`; `sio status` may surface `worker_error`. |
 | Share problem | Read `worker.log`; confirm com0com `setupc.exe` is installed and discoverable. |
-| Stale PID | Run `gs stop <session>`; cleanup should handle missing processes. |
+| Stale PID | Run `sio stop <session>`; cleanup should handle missing processes. |
 
 ## Acknowledgements and licenses
 
-The `gs` source code is released under the MIT License. See `LICENSE`.
+The `sio` source code is released under the MIT License. See `LICENSE`.
 
-`gs` is designed with respect for the projects it can integrate with. Thanks to
+`sio` is designed with respect for the projects it can integrate with. Thanks to
 the com0com project for making practical virtual COM-port workflows available on
 Windows.
 

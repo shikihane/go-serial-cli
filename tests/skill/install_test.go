@@ -60,9 +60,10 @@ func TestBundledSkillExplainsOpenStartsSessionWorker(t *testing.T) {
 	}
 	text := string(data)
 	for _, want := range []string{
-		"`gs open` starts a session worker",
+		"`sio open` starts a session worker",
 		"keeps the physical port open",
-		"`gs send`, `gs ask`, `gs shell`, and `gs read` then coordinate through that session",
+		"`sio send`, `sio ask`, `sio shell`, and `sio read` then coordinate through that session",
+		"If `sio` is not installed but `gs` is, use `gs` as the legacy alias.",
 		"Exiting shell leaves the background session worker running",
 	} {
 		if !strings.Contains(text, want) {

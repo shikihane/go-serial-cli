@@ -575,6 +575,7 @@ func TestShareBridgeListensOnTCPAddress(t *testing.T) {
 	hubA := newMemorySerialPort()
 	stop := make(chan struct{})
 	errCh := make(chan error, 1)
+	ready := make(chan string, 1)
 	go func() {
 		errCh <- ShareBridge(ShareBridgeOptions{
 			PhysicalPort: "COM3",
@@ -582,6 +583,9 @@ func TestShareBridgeListensOnTCPAddress(t *testing.T) {
 			Baud:         115200,
 			TCPAddress:   address,
 			Stop:         stop,
+			OnListening: func(address string) {
+				ready <- address
+			},
 			OpenPort: openMemoryPorts(t, map[string]*memorySerialPort{
 				"COM3":   physical,
 				"CNCB20": hubA,
@@ -589,6 +593,14 @@ func TestShareBridgeListensOnTCPAddress(t *testing.T) {
 		})
 	}()
 	defer stopShareBridge(t, stop, errCh)
+	select {
+	case got := <-ready:
+		if got != address {
+			t.Fatalf("ready address = %q, want %q", got, address)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for share bridge ready callback")
+	}
 	waitForTCPServer(t, address)
 
 	physical.injectRead("OK\r\n")

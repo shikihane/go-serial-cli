@@ -20,7 +20,7 @@ import (
 	workerpkg "go-serial-cli/internal/worker"
 )
 
-var ErrSessionPaused = errors.New("serial session is paused; run gs resume first")
+var ErrSessionPaused = errors.New("serial session is paused")
 
 var ErrShellInputInterrupted = errors.New("shell input read interrupted")
 
@@ -31,6 +31,7 @@ type App struct {
 }
 
 type AppDeps struct {
+	CommandName           string
 	InstallSkill          func(source string, to string) error
 	StartWorker           func(sessionName string) (int, error)
 	StopProcess           func(pid int) error
@@ -38,6 +39,7 @@ type AppDeps struct {
 	WaitForControl        func(address string) error
 	CreateVirtualPorts    func(pairs []VirtualPortPair) error
 	RemoveVirtualPorts    func(pairs []VirtualPortPair) error
+	ClearSharePorts       func() error
 	RunSetupC             func(args []string, output io.Writer) error
 	AdminPause            func()
 	BridgeTCP             func(opts serialcmd.TCPBridgeOptions) error
@@ -63,6 +65,26 @@ func New(deps AppDeps) *App {
 		deps.Version = DefaultVersionInfo()
 	}
 	return &App{deps: deps}
+}
+
+func (a *App) commandName() string {
+	name := strings.TrimSpace(a.deps.CommandName)
+	if name == "" {
+		return "sio"
+	}
+	return name
+}
+
+func (a *App) usage(command string) error {
+	return fmt.Errorf("usage: %s %s", a.commandName(), command)
+}
+
+func (a *App) pausedSessionError() error {
+	return fmt.Errorf("%w; run %s resume first", ErrSessionPaused, a.commandName())
+}
+
+func (a *App) sharedControlUnavailable() error {
+	return fmt.Errorf("shared session control channel is unavailable; run %s share <session> <virtual-port>... again", a.commandName())
 }
 
 func (a *App) Run(args []string, out io.Writer) error {
@@ -129,7 +151,7 @@ func (a *App) Run(args []string, out io.Writer) error {
 
 func (a *App) runSkill(args []string) error {
 	if len(args) < 1 || args[0] != "install" {
-		return errors.New("usage: gs skill install [source] [--to codex|claude|dir]")
+		return a.usage("skill install [source] [--to codex|claude|dir]")
 	}
 
 	source := ""
@@ -138,13 +160,13 @@ func (a *App) runSkill(args []string) error {
 		switch args[i] {
 		case "--to":
 			if i+1 >= len(args) {
-				return errors.New("usage: gs skill install [source] [--to codex|claude|dir]")
+				return a.usage("skill install [source] [--to codex|claude|dir]")
 			}
 			to = args[i+1]
 			i++
 		default:
 			if source != "" {
-				return errors.New("usage: gs skill install [source] [--to codex|claude|dir]")
+				return a.usage("skill install [source] [--to codex|claude|dir]")
 			}
 			source = args[i]
 		}
@@ -167,6 +189,7 @@ func DefaultDeps() (AppDeps, error) {
 		WaitForControl:        waitForControlAddress,
 		CreateVirtualPorts:    createVirtualPorts,
 		RemoveVirtualPorts:    removeVirtualPorts,
+		ClearSharePorts:       clearSharePorts,
 		RunSetupC:             runSetupCDirect,
 		AdminPause:            pauseAdminWindow,
 		BridgeTCP:             serialcmd.BridgeTCP,
@@ -202,8 +225,19 @@ func (a *App) runAdmin(args []string, out io.Writer) error {
 		err := runSetupCOperationsInAdminWindow([]setupCOperation{{Description: "run setupc.exe", Args: setupcArgs}}, out, runSetupC)
 		pause()
 		return err
-	case len(args) == 2 && args[0] == "setupc-batch":
-		ops, err := decodeSetupCOperations(args[1])
+	case len(args) >= 2 && args[0] == "setupc-batch":
+		encoded := args[1]
+		logPath := adminLogPath(args[2:])
+		if logPath != "" {
+			var file *os.File
+			file, err := os.Create(logPath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			out = io.MultiWriter(out, file)
+		}
+		ops, err := decodeSetupCOperations(encoded)
 		if err != nil {
 			_, _ = fmt.Fprintf(out, "FAILED: decode setupc batch: %v\n\n", err)
 			pause()
@@ -212,9 +246,42 @@ func (a *App) runAdmin(args []string, out io.Writer) error {
 		err = runSetupCOperationsInAdminWindow(ops, out, runSetupC)
 		pause()
 		return err
+	case len(args) >= 2 && args[0] == "pnp-remove":
+		parents, logPath := splitAdminLogArg(args[1:])
+		if logPath != "" {
+			var file *os.File
+			file, err := os.Create(logPath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			out = io.MultiWriter(out, file)
+		}
+		err := runPnpRemoveParents(parents, out)
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "\nFAILED: %v\n\n", err)
+			pause()
+		}
+		return err
 	default:
-		return errors.New("usage: gs admin setupc <args...>")
+		return a.usage("admin setupc <args...>")
 	}
+}
+
+func adminLogPath(args []string) string {
+	_, logPath := splitAdminLogArg(args)
+	return logPath
+}
+
+func splitAdminLogArg(args []string) ([]string, string) {
+	clean := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--log" && i+1 < len(args) {
+			return append(clean, args[i+2:]...), args[i+1]
+		}
+		clean = append(clean, args[i])
+	}
+	return clean, ""
 }
 
 func runSetupCOperationsInAdminWindow(ops []setupCOperation, out io.Writer, runSetupC setupCRunner) error {
@@ -222,6 +289,11 @@ func runSetupCOperationsInAdminWindow(ops []setupCOperation, out io.Writer, runS
 	for _, op := range ops {
 		if op.Description != "" {
 			_, _ = fmt.Fprintf(out, "%s\n", op.Description)
+		}
+		if err := releaseStaleCOMNameReservationsForOperation(op, out); err != nil {
+			runErr = err
+			_, _ = fmt.Fprintf(out, "\nFAILED: %v\n\n", err)
+			break
 		}
 		_, _ = fmt.Fprintf(out, "Running com0com setupc.exe %s\n\n", strings.Join(op.Args, " "))
 		err := runSetupC(op.Args, out)
@@ -243,7 +315,7 @@ func runSetupCOperationsInAdminWindow(ops []setupCOperation, out io.Writer, runS
 
 func (a *App) runTools(args []string, out io.Writer) error {
 	if len(args) != 2 || args[0] != "extract" {
-		return errors.New("usage: gs tools extract <dir>")
+		return a.usage("tools extract <dir>")
 	}
 	return errors.New("no third-party tools are bundled; install com0com externally and make setupc.exe discoverable on PATH")
 }
@@ -269,7 +341,7 @@ func (a *App) runPorts(out io.Writer) error {
 
 func (a *App) runOpen(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return errors.New("usage: gs open <session> <port> [-b baud]")
+		return a.usage("open <session> <port> [-b baud]")
 	}
 	name := args[0]
 	port := args[1]
@@ -281,7 +353,7 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 		switch args[i] {
 		case "-b":
 			if i+1 >= len(args) {
-				return errors.New("usage: gs open <session> <port> [-b baud]")
+				return a.usage("open <session> <port> [-b baud]")
 			}
 			parsed, err := strconv.Atoi(args[i+1])
 			if err != nil {
@@ -290,17 +362,19 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 			baud = parsed
 			i++
 		default:
-			return errors.New("usage: gs open <session> <port> [-b baud]")
+			return a.usage("open <session> <port> [-b baud]")
 		}
 	}
 	if port == "" {
-		return errors.New("usage: gs open <session> <port> [-b baud]")
+		return a.usage("open <session> <port> [-b baud]")
 	}
 	if baud <= 0 {
 		return errors.New("baud rate must be positive")
 	}
 	if a.deps.Store.Dir != "" {
-		if loadedState, err := a.deps.Store.Load(name); err == nil {
+		loadedState, loadErr := a.deps.Store.Load(name)
+		hadPreviousState := loadErr == nil
+		if hadPreviousState {
 			if err := a.stopLiveResources(loadedState); err != nil {
 				return err
 			}
@@ -317,6 +391,13 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 			return err
 		}
 		if err := a.startSessionWorker(name); err != nil {
+			if hadPreviousState {
+				if saveErr := a.deps.Store.Save(loadedState); saveErr != nil {
+					return errors.Join(err, saveErr)
+				}
+			} else if removeErr := a.deps.Store.Remove(name); removeErr != nil {
+				return errors.Join(err, removeErr)
+			}
 			return err
 		}
 	}
@@ -367,7 +448,7 @@ func (a *App) startSessionWorker(name string) error {
 
 func (a *App) runSend(args []string, out io.Writer) error {
 	if len(args) != 2 {
-		return errors.New("usage: gs send <session> <data>")
+		return a.usage("send <session> <data>")
 	}
 	name := args[0]
 	if a.deps.Store.Dir != "" && (a.deps.SendSerial != nil || a.deps.SendSession != nil) {
@@ -376,7 +457,7 @@ func (a *App) runSend(args []string, out io.Writer) error {
 			return err
 		}
 		if state.Paused {
-			return ErrSessionPaused
+			return a.pausedSessionError()
 		}
 		if address, ok, err := sessionDialAddress(state); err != nil {
 			return err
@@ -385,7 +466,7 @@ func (a *App) runSend(args []string, out io.Writer) error {
 				return err
 			}
 		} else if state.Status == session.StatusSharing {
-			return errors.New("shared session control channel is unavailable; run gs share <session> <virtual-port>... again")
+			return a.sharedControlUnavailable()
 		} else if a.deps.SendSerial != nil {
 			if err := a.deps.SendSerial(state.Port, state.Baud, args[1]); err != nil {
 				return err
@@ -400,7 +481,7 @@ func (a *App) runSend(args []string, out io.Writer) error {
 
 func (a *App) runAsk(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return errors.New("usage: gs ask <session> <data> [-t seconds] [-l lines]")
+		return a.usage("ask <session> <data> [-t seconds] [-l lines]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -414,7 +495,7 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: gs ask <session> <data> [-t seconds] [-l lines]")
+		return a.usage("ask <session> <data> [-t seconds] [-l lines]")
 	}
 	if *timeoutSeconds <= 0 {
 		return errors.New("ask timeout must be positive")
@@ -439,7 +520,7 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 		return err
 	}
 	if state.Paused {
-		return ErrSessionPaused
+		return a.pausedSessionError()
 	}
 	if address, ok, err := sessionDialAddress(state); err != nil {
 		return err
@@ -450,7 +531,7 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 		return a.askViaSessionWorker(state, address, args[1], time.Duration(*timeoutSeconds*float64(time.Second)), *maxLines, out)
 	}
 	if state.Status == session.StatusSharing {
-		return errors.New("shared session control channel is unavailable; run gs share <session> <virtual-port>... again")
+		return a.sharedControlUnavailable()
 	}
 	if a.deps.AskSerial == nil {
 		return errors.New("serial ask is unavailable")
@@ -542,7 +623,7 @@ func teeOutput(out io.Writer, path string) (io.Writer, func(), error) {
 
 func (a *App) runShell(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs shell <session>")
+		return a.usage("shell <session>")
 	}
 	input := a.deps.Stdin
 	usingDefaultStdin := input == nil || input == os.Stdin
@@ -682,7 +763,7 @@ func isShellInputInterrupted(err error) bool {
 
 func (a *App) runTee(args []string, out io.Writer) error {
 	if len(args) != 2 {
-		return errors.New("usage: gs tee <session> <file>")
+		return a.usage("tee <session> <file>")
 	}
 	return a.runStream(args[0], serialcmd.StreamOptions{TeePath: args[1]}, out)
 }
@@ -704,7 +785,7 @@ func (a *App) runStream(name string, opts serialcmd.StreamOptions, out io.Writer
 		return err
 	}
 	if state.Paused {
-		return ErrSessionPaused
+		return a.pausedSessionError()
 	}
 	if address, ok, err := sessionDialAddress(state); err != nil {
 		return err
@@ -721,7 +802,7 @@ func (a *App) runStream(name string, opts serialcmd.StreamOptions, out io.Writer
 		}
 		return a.deps.StreamSession(address, opts.Input, output)
 	} else if state.Status == session.StatusSharing {
-		return errors.New("shared session control channel is unavailable; run gs share <session> <virtual-port>... again")
+		return a.sharedControlUnavailable()
 	}
 	if a.deps.StreamSerial == nil {
 		return errors.New("serial streaming is unavailable")
@@ -735,7 +816,7 @@ func (a *App) runStream(name string, opts serialcmd.StreamOptions, out io.Writer
 
 func (a *App) runRead(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: gs read <session> [-n count] [--to file]")
+		return a.usage("read <session> [-n count] [--to file]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -749,7 +830,7 @@ func (a *App) runRead(args []string, out io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: gs read <session> [-n count] [--to file]")
+		return a.usage("read <session> [-n count] [--to file]")
 	}
 	if *n < 0 {
 		return errors.New("read count must not be negative")
@@ -824,7 +905,7 @@ func copyCacheToFile(cachePath string, destPath string, lastBytes int64) (int64,
 
 func (a *App) runCheck(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: gs check <session> [-n count] [--from offset] [--rewind count] [--to file]")
+		return a.usage("check <session> [-n count] [--from offset] [--rewind count] [--to file]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -840,7 +921,7 @@ func (a *App) runCheck(args []string, out io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: gs check <session> [-n count] [--from offset] [--rewind count] [--to file]")
+		return a.usage("check <session> [-n count] [--from offset] [--rewind count] [--to file]")
 	}
 	if *n < 0 {
 		return errors.New("check count must not be negative")
@@ -947,7 +1028,10 @@ func createOutputFile(path string) (*os.File, error) {
 
 func (a *App) runClear(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs clear <session>")
+		return a.usage("clear <session>|--share")
+	}
+	if args[0] == "--share" {
+		return a.runClearShare(out)
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -972,9 +1056,42 @@ func (a *App) runClear(args []string, out io.Writer) error {
 	return nil
 }
 
+func (a *App) runClearShare(out io.Writer) error {
+	var clearErr error
+	_, _ = fmt.Fprintln(out, "clearing shared virtual ports")
+	if a.deps.Store.Dir != "" {
+		states, err := a.deps.Store.List()
+		if err != nil {
+			return err
+		}
+		for _, state := range states {
+			if len(state.VirtualPorts) == 0 && len(state.HubPorts) == 0 && state.Status != session.StatusSharing {
+				continue
+			}
+			if err := a.stopProcessesOnly(state); err != nil {
+				clearErr = errors.Join(clearErr, fmt.Errorf("%s: %w", state.Name, err))
+			}
+			if err := a.deps.Store.Stop(state.Name); err != nil {
+				clearErr = errors.Join(clearErr, fmt.Errorf("%s: %w", state.Name, err))
+			}
+		}
+	}
+	if a.deps.ClearSharePorts != nil {
+		if err := a.deps.ClearSharePorts(); err != nil {
+			clearErr = errors.Join(clearErr, err)
+		}
+	}
+	if clearErr != nil {
+		_, _ = fmt.Fprintf(out, "shared virtual port cleanup failed: %v\n", clearErr)
+		return clearErr
+	}
+	_, _ = fmt.Fprintln(out, "shared virtual ports cleared")
+	return nil
+}
+
 func (a *App) runTCP(args []string, out io.Writer) error {
 	if len(args) != 2 {
-		return errors.New("usage: gs tcp <session> <listen-address>")
+		return a.usage("tcp <session> <listen-address>")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1051,7 +1168,7 @@ func (a *App) runTCP(args []string, out io.Writer) error {
 
 func (a *App) runShare(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return errors.New("usage: gs share <session> <virtual-port> [virtual-port...]")
+		return a.usage("share <session> <virtual-port> [virtual-port...]")
 	}
 	name := args[0]
 	virtualPorts := append([]string(nil), args[1:]...)
@@ -1070,9 +1187,8 @@ func (a *App) runShare(args []string, out io.Writer) error {
 		state.Paused = false
 		state.VirtualPorts = virtualPorts
 		state.HubPorts = hubPortsFor(virtualPorts)
-		state.TCPAddress = ""
 		state.ControlAddress = ""
-		if len(virtualPorts) > 1 && a.deps.ReserveControlAddress != nil {
+		if len(virtualPorts) > 0 && a.deps.ReserveControlAddress != nil {
 			controlAddress, err := a.deps.ReserveControlAddress()
 			if err != nil {
 				return err
@@ -1081,13 +1197,13 @@ func (a *App) runShare(args []string, out io.Writer) error {
 		}
 		state.WorkerPID = 0
 		state.HubPID = 0
+		if err := a.deps.Store.Save(state); err != nil {
+			return err
+		}
 		if a.deps.CreateVirtualPorts != nil {
 			if err := a.deps.CreateVirtualPorts(portPairs(state.VirtualPorts, state.HubPorts)); err != nil {
 				return err
 			}
-		}
-		if err := a.deps.Store.Save(state); err != nil {
-			return err
 		}
 		if a.deps.StartWorker != nil {
 			pid, err := a.deps.StartWorker(name)
@@ -1180,7 +1296,7 @@ func (a *App) stopLiveResources(state session.State) error {
 
 func (a *App) runWorker(args []string, out io.Writer) error {
 	if len(args) != 2 {
-		return errors.New("usage: gs worker share|tcp <session>")
+		return a.usage("worker share|tcp <session>")
 	}
 	switch args[0] {
 	case "run":
@@ -1190,7 +1306,7 @@ func (a *App) runWorker(args []string, out io.Writer) error {
 	case "tcp":
 		return a.runWorkerTCP(args[1], out)
 	default:
-		return errors.New("usage: gs worker share|tcp <session>")
+		return a.usage("worker share|tcp <session>")
 	}
 }
 
@@ -1234,7 +1350,7 @@ func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 		appendWorkerLog("worker exit")
 	}()
 	if state.Paused {
-		return ErrSessionPaused
+		return a.pausedSessionError()
 	}
 	if state.ControlAddress == "" {
 		return errors.New("session control address is required")
@@ -1280,7 +1396,7 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 		appendWorkerLog("worker exit")
 	}()
 	if state.Paused {
-		return ErrSessionPaused
+		return a.pausedSessionError()
 	}
 	state.Status = session.StatusSharing
 	state.WorkerPID = os.Getpid()
@@ -1307,6 +1423,9 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 				CachePath:      a.deps.Store.CachePath(name),
 				ControlAddress: controlAddress,
 				TCPAddress:     state.TCPAddress,
+				OnListening: func(address string) {
+					appendWorkerLog("worker ready listen=" + address)
+				},
 			})
 		})
 	}
@@ -1346,7 +1465,7 @@ func (a *App) runWorkerTCP(name string, out io.Writer) (retErr error) {
 		appendWorkerLog("worker exit")
 	}()
 	if state.Paused {
-		return ErrSessionPaused
+		return a.pausedSessionError()
 	}
 	if state.TCPAddress == "" {
 		return errors.New("tcp listen address is required")
@@ -1540,14 +1659,14 @@ func (a *App) runWorkerWithRetry(name string, appendWorkerLog func(string), fn f
 
 func (a *App) runPause(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs pause <session>")
+		return a.usage("pause <session>")
 	}
 	return a.setPaused(args[0], true, out)
 }
 
 func (a *App) runResume(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs resume <session>")
+		return a.usage("resume <session>")
 	}
 	return a.setPaused(args[0], false, out)
 }
@@ -1589,7 +1708,7 @@ func (a *App) setPaused(name string, paused bool, out io.Writer) error {
 
 func (a *App) runStatus(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs status <session>")
+		return a.usage("status <session>")
 	}
 	name := args[0]
 	if a.deps.Store.Dir == "" {
@@ -1606,7 +1725,7 @@ func (a *App) runStatus(args []string, out io.Writer) error {
 
 func (a *App) runLog(args []string, out io.Writer) error {
 	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: gs log <session> [--worker]")
+		return a.usage("log <session> [--worker]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1618,7 +1737,7 @@ func (a *App) runLog(args []string, out io.Writer) error {
 		case "--worker":
 			logKind = "worker"
 		default:
-			return errors.New("usage: gs log <session> [--worker]")
+			return a.usage("log <session> [--worker]")
 		}
 	}
 	if a.deps.Store.Dir == "" {
@@ -1644,7 +1763,7 @@ func (a *App) runLog(args []string, out io.Writer) error {
 
 func (a *App) runList(args []string, out io.Writer) error {
 	if len(args) != 0 {
-		return errors.New("usage: gs list")
+		return a.usage("list")
 	}
 	if a.deps.Store.Dir == "" {
 		_, _ = fmt.Fprintln(out, "no sessions")
@@ -1679,7 +1798,7 @@ func (a *App) runList(args []string, out io.Writer) error {
 
 func (a *App) runStop(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs stop <session>")
+		return a.usage("stop <session>")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1692,10 +1811,19 @@ func (a *App) runStop(args []string, out io.Writer) error {
 		}
 		stopErr := a.stopLiveResources(state)
 		if stopErr != nil {
-			return stopErr
-		}
-		if err := a.deps.Store.Stop(name); err != nil {
-			return err
+			state.Status = session.StatusStopped
+			state.Paused = false
+			state.TCPAddress = ""
+			state.ControlAddress = ""
+			state.CheckOffset = 0
+			state.WorkerPID = 0
+			state.HubPID = 0
+			if err := a.deps.Store.Save(state); err != nil {
+				return errors.Join(stopErr, err)
+			}
+			_, _ = fmt.Fprintf(out, "warning: cleanup for %s was incomplete: %v\n", name, stopErr)
+		} else if err := a.deps.Store.Stop(name); err != nil {
+			return errors.Join(stopErr, err)
 		}
 	}
 	_, _ = fmt.Fprintf(out, "stopped %s\n", name)
@@ -1704,7 +1832,7 @@ func (a *App) runStop(args []string, out io.Writer) error {
 
 func (a *App) runRM(args []string, out io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: gs rm <session>")
+		return a.usage("rm <session>")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1717,10 +1845,22 @@ func (a *App) runRM(args []string, out io.Writer) error {
 		}
 		stopErr := a.stopLiveResources(state)
 		if stopErr != nil {
-			return stopErr
+			state.Status = session.StatusStopped
+			state.Paused = false
+			state.TCPAddress = ""
+			state.ControlAddress = ""
+			state.CheckOffset = 0
+			state.WorkerPID = 0
+			state.HubPID = 0
+			if err := a.deps.Store.Save(state); err != nil {
+				return errors.Join(stopErr, err)
+			}
+			_, _ = fmt.Fprintf(out, "warning: cleanup for %s was incomplete: %v\n", name, stopErr)
+			_, _ = fmt.Fprintf(out, "%s not removed; run %s clear --share or retry %s rm %s after closing ports\n", name, a.commandName(), a.commandName(), name)
+			return nil
 		}
 		if err := a.deps.Store.Remove(name); err != nil {
-			return err
+			return errors.Join(stopErr, err)
 		}
 	}
 	_, _ = fmt.Fprintf(out, "removed %s\n", name)
@@ -1746,32 +1886,34 @@ func (a *App) waitForProcessExit(pid int) error {
 
 func (a *App) printHelp(out io.Writer) {
 	info := a.deps.Version.Normalize()
-	_, _ = fmt.Fprintf(out, "gs - serial CLI\n")
+	name := a.commandName()
+	_, _ = fmt.Fprintf(out, "%s - serial CLI\n", name)
 	_, _ = fmt.Fprintf(out, "version: %s commit=%s built_at=%s go=%s\n", info.Version, info.Commit, info.BuiltAt, info.GoVersion)
-	_, _ = fmt.Fprintln(out, `
+	_, _ = fmt.Fprintf(out, `
 
 Usage:
-  gs version
-  gs -v
-  gs ports
-  gs open <session> <port> [-b baud]
-  gs send <session> <data>
-  gs ask <session> <data> [-t seconds] [-l lines]
-  gs read <session> [-n count] [--to file]
-  gs check <session> [-n count] [--from offset] [--rewind count] [--to file]
-  gs clear <session>
-  gs shell <session>
-  gs tee <session> <file>
-  gs share <session> <virtual-port> [virtual-port...]
-  gs tcp <session> <listen-address>
-  gs pause <session>
-  gs resume <session>
-  gs status <session>
-  gs log <session> [--worker]
-  gs stop <session>
-  gs rm <session>
-  gs list
-  gs skill install [source] [--to codex|claude|dir]`)
+  %[1]s version
+  %[1]s -v
+  %[1]s ports
+  %[1]s open <session> <port> [-b baud]
+  %[1]s send <session> <data>
+  %[1]s ask <session> <data> [-t seconds] [-l lines]
+  %[1]s read <session> [-n count] [--to file]
+  %[1]s check <session> [-n count] [--from offset] [--rewind count] [--to file]
+  %[1]s clear <session>
+  %[1]s clear --share
+  %[1]s shell <session>
+  %[1]s tee <session> <file>
+  %[1]s share <session> <virtual-port> [virtual-port...]
+  %[1]s tcp <session> <listen-address>
+  %[1]s pause <session>
+  %[1]s resume <session>
+  %[1]s status <session>
+  %[1]s log <session> [--worker]
+  %[1]s stop <session>
+  %[1]s rm <session>
+  %[1]s list
+  %[1]s skill install [source] [--to codex|claude|dir]`, name)
 }
 
 func (a *App) printVersion(out io.Writer) {

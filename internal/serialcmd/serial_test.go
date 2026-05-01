@@ -145,6 +145,73 @@ func TestStreamOutputAppendsTeeFile(t *testing.T) {
 	assertFileContent(t, teePath, "first\nsecond\n")
 }
 
+func TestAskWritesPayloadAndCopiesLastResponseLinesToOutputAndCache(t *testing.T) {
+	port := newMemorySerialPort()
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "cache.log")
+	var out bytes.Buffer
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Ask(AskOptions{
+			Port:      "COM3",
+			Baud:      115200,
+			Data:      "AT\\r\\n",
+			Timeout:   time.Second,
+			MaxLines:  2,
+			Output:    &out,
+			CachePath: cachePath,
+			OpenPort: func(portName string, baud int) (SerialPort, error) {
+				if portName != "COM3" || baud != 115200 {
+					t.Fatalf("open args = %q %d", portName, baud)
+				}
+				return port, nil
+			},
+		})
+	}()
+
+	if got := port.waitWritten(t); got != "AT\r\n" {
+		t.Fatalf("written data = %q, want AT CRLF", got)
+	}
+	port.injectRead("OK\r\nREADY\r\nEXTRA\r\n")
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Ask returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ask did not return after reaching line limit")
+	}
+	if got := out.String(); got != "READY\r\nEXTRA\r\n" {
+		t.Fatalf("output = %q, want last two lines", got)
+	}
+	assertFileContent(t, cachePath, "READY\r\nEXTRA\r\n")
+}
+
+func TestAskStopsAfterTimeoutWhenLineLimitIsZero(t *testing.T) {
+	port := newMemorySerialPort()
+	var out bytes.Buffer
+
+	err := Ask(AskOptions{
+		Port:     "COM3",
+		Baud:     115200,
+		Data:     "\\x03",
+		Timeout:  20 * time.Millisecond,
+		MaxLines: 0,
+		Output:   &out,
+		OpenPort: func(portName string, baud int) (SerialPort, error) {
+			return port, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Ask returned error: %v", err)
+	}
+	if got := port.waitWritten(t); got != string([]byte{0x03}) {
+		t.Fatalf("written data = %q, want Ctrl+C", got)
+	}
+}
+
 func TestBridgeTCPMovesDataBetweenClientAndSerialPort(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -460,6 +527,40 @@ func TestShareBridgeRoutesControlClientInputOnlyToPhysical(t *testing.T) {
 	}
 	if got := hubB.waitWritten(t); got != "OK\r\n" {
 		t.Fatalf("hubB write = %q, want OK CRLF", got)
+	}
+}
+
+func TestShareBridgeListensOnTCPAddress(t *testing.T) {
+	address := freeTCPAddress(t)
+	physical := newMemorySerialPort()
+	hubA := newMemorySerialPort()
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ShareBridge(ShareBridgeOptions{
+			PhysicalPort: "COM3",
+			HubPorts:     []string{"CNCB20"},
+			Baud:         115200,
+			TCPAddress:   address,
+			Stop:         stop,
+			OpenPort: openMemoryPorts(t, map[string]*memorySerialPort{
+				"COM3":   physical,
+				"CNCB20": hubA,
+			}),
+		})
+	}()
+	defer stopShareBridge(t, stop, errCh)
+	waitForTCPServer(t, address)
+
+	physical.injectRead("OK\r\n")
+	if err := SendToSession(address, "help\\r\\n"); err != nil {
+		t.Fatalf("SendToSession returned error: %v", err)
+	}
+	if got := physical.waitWritten(t); got != "help\r\n" {
+		t.Fatalf("physical write = %q, want help CRLF", got)
+	}
+	if got := hubA.waitWritten(t); got != "OK\r\n" {
+		t.Fatalf("hub write = %q, want OK CRLF", got)
 	}
 }
 

@@ -6,6 +6,37 @@
 
 当前目标是保持简单：一个二进制文件、短命令、本地文件保存状态和日志，并且清理操作只影响你指定的会话。
 
+## 快速开始
+
+```bash
+gs version
+gs ports
+gs open dev1 COM3 -b 115200
+gs send dev1 "AT\r\n"
+gs ask dev1 "AT\r\n"
+gs read dev1 -n 200
+gs check dev1 -n 200
+gs stop dev1
+```
+
+`gs open` 记录一个命名会话，并启动后台 worker 持有物理串口、读取串口输出、追加到 `cache.log`。`send`、`ask`、`read`、`check` 和 `shell` 会通过这个命名会话协作。
+
+```bash
+gs shell dev1
+gs tee dev1 serial.log
+gs tcp dev1 :7001
+gs share dev1 COM20 COM21
+```
+
+只清理你指定的会话：
+
+```bash
+gs stop dev1
+gs rm dev1
+```
+
+`stop` 释放运行中的资源并保留会话文件。`rm` 执行同样的运行中清理，然后删除该会话的状态、缓存和日志。
+
 ## 为什么 Windows 优先
 
 很多工业 PC、工厂测试台、嵌入式调试台和厂商调试工具仍然运行在 Windows 上。Linux 和 macOS 已经有不少成熟的终端工具；在 Windows 上，串口工作经常被分散到 GUI 工具、厂商程序、虚拟 COM 驱动和零散脚本里。
@@ -199,47 +230,12 @@ go install -ldflags "-X go-serial-cli/internal/cli.BuildVersion=dev -X go-serial
 下载 com0com 和 hub4com：
 
 ```text
-https://com0com.com/
-https://sourceforge.net/projects/com0com/
+com0com 项目站点：https://com0com.com/
+com0com SourceForge 项目：https://sourceforge.net/projects/com0com/
+hub4com SourceForge 文件：https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 请手动安装驱动。`gs` 不应该静默安装内核驱动。本仓库不 vendor 或再分发 com0com 安装器、hub4com 二进制文件。
-
-## 第三方工具和许可证
-
-`gs` 尊重它可以集成的上游项目。com0com 让 Windows 上实用的虚拟 COM 端口工作流成为可能，hub4com 提供了串口路由模型，启发了 `gs share`，并且仍可作为外部 fallback 使用。这个项目感谢这些工作。
-
-为了保持清晰的许可边界，本仓库不包含 com0com 或 hub4com 的二进制、安装器、批处理文件或文档副本。选择使用这些工具的用户，应从上游项目下载，并遵守它们各自的许可证。`gs` 源码计划与这些外部工具分开授权。
-
-## 快速开始
-
-```bash
-gs version
-gs ports
-gs open dev1 COM3 -b 115200
-gs send dev1 "AT\r\n"
-gs read dev1 -n 200
-gs check dev1 -n 200
-gs stop dev1
-```
-
-`gs open` 记录一个命名会话。它不表示 CLI 已经变成你的串口终端。需要实时串口 I/O 时，请使用一个活动 owner：
-
-```bash
-gs shell dev1
-gs tee dev1 serial.log
-gs tcp dev1 :7001
-gs share dev1 COM20 COM21
-```
-
-只清理你指定的会话：
-
-```bash
-gs stop dev1
-gs rm dev1
-```
-
-`stop` 释放运行中的资源并保留会话文件。`rm` 执行同样的运行中清理，然后删除该会话的状态、缓存和日志。
 
 ## 命令模型
 
@@ -264,6 +260,8 @@ gs send dev1 "\x03"
 gs send dev1 "\cC"
 gs send dev1 "\x1b"
 gs send dev1 "\x04"
+gs ask dev1 "AT\r\n"
+gs ask dev1 "ATI\r\n" -t 1.5 -l 5
 ```
 
 payload 支持显式转义：
@@ -277,6 +275,10 @@ payload 支持显式转义：
 | `\cX` | ASCII 控制字符 `Ctrl+X` |
 
 `^C` 这样的裸写法只是普通文本。这样可以让字面 payload 保持明确。
+
+`gs ask` 会发送一个 payload，然后在短时间窗口内读取新的串口回传。默认窗口是 0.5 秒，
+默认输出最后 50 行。用 `-t <seconds>` 调整窗口，用 `-l <lines>` 输出最后 N 行。
+`-l 0` 表示不限制行数。
 
 ### 读取缓存输出
 
@@ -400,11 +402,12 @@ flowchart TB
     com0com <--> app
 ```
 
-简单命令是短生命周期的：
+普通命令仍然是短生命周期的：
 
 - `gs ports` 通过 `go.bug.st/serial` 查询可用端口。
-- `gs open dev1 COM3 -b 115200` 写入 `state.json`。
-- `gs send dev1 ...` 打开配置的端口，写入字节，然后退出。
+- `gs open dev1 COM3 -b 115200` 写入 `state.json`，启动后台 session worker，并保持配置的端口打开，直到 `stop` 或 `rm`。
+- `gs send dev1 ...` 在 worker 运行时通过 session worker 写入字节。
+- `gs ask dev1 ...` 在 worker 运行时通过 session worker 写入字节，然后从新追加的缓存读取一小段回传窗口。
 - `gs read` 和 `gs check` 读取 `cache.log`。
 
 实时模式会保持某些资源打开：
@@ -474,15 +477,16 @@ hub4com.log
 
 使用 `gs log <session>` 查看 `worker.log`。诊断 `gs share` 时，用 `gs log <session> --hub` 查看 `hub4com.log`。
 
-当 `worker_state` 和 `hub_state` 都是 `stopped` 时，后台没有新的串口输出追加。`read` 和 `check` 仍然可以检查旧缓存，但它们不是实时设备读取。
+当 `worker_state` 和 `hub_state` 都是 `stopped` 时，后台没有新的串口输出追加。`read` 和 `check` 仍然可以检查旧缓存，但它们不是实时设备读取。运行 `gs open <session> <port> -b <baud>` 可以重启 session worker。
 
 ## Windows 设置
 
 使用 `gs share` 前，请手动安装 com0com：
 
 ```text
-https://com0com.com/
-https://sourceforge.net/projects/com0com/
+com0com 项目站点：https://com0com.com/
+com0com SourceForge 项目：https://sourceforge.net/projects/com0com/
+hub4com SourceForge 文件：https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 安装 com0com 后，确保 `setupc.exe` 在 `PATH` 中，或安装在 `Program Files` 下的标准 com0com 位置。
@@ -575,3 +579,11 @@ dist/
 | Worker 启动失败 | 读取 `worker.log`；`gs status` 可能显示 `worker_error`。 |
 | hub4com/share 问题 | 读取 `hub4com.log`；确认已安装 com0com `setupc.exe` 且可被发现。 |
 | 陈旧 PID | 运行 `gs stop <session>`；清理逻辑应能处理缺失进程。 |
+
+## 致谢和许可证
+
+`gs` 源码使用 MIT License 发布。详见 `LICENSE`。
+
+`gs` 尊重它可以集成的上游项目。感谢 com0com 项目让 Windows 上实用的虚拟 COM 端口工作流成为可能，也感谢 hub4com 项目提供串口路由模型，启发了 `gs share`，并且仍可作为外部 fallback 使用。
+
+为了保持清晰的许可边界，本仓库不包含 com0com 或 hub4com 的二进制、安装器、批处理文件或文档副本。选择使用这些工具的用户，应从上游项目下载，并遵守它们各自的许可证。

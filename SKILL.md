@@ -10,19 +10,20 @@ Use `gs` as a single-binary CLI for agent-friendly serial-port work. Optimize fo
 ## Default Workflow
 
 1. Discover ports: `gs ports`.
-2. Name the device: `gs open dev1 COM3 -b 115200`.
-3. Send bytes: `gs send dev1 "AT\r\n"` or `gs send dev1 "\x03"`.
-4. Check liveness before expecting new output: `gs status dev1`.
-5. Read cached output without consuming it: `gs read dev1 -n 200`.
-6. Poll only new cached output: `gs check dev1 -n 200`.
-7. Reset output state when needed: `gs clear dev1`.
-8. Use one long-running mode only when needed:
-   - `gs shell dev1` for foreground interactive serial ownership.
+2. Name and start the device worker: `gs open dev1 COM3 -b 115200`.
+3. Send bytes through that worker: `gs send dev1 "AT\r\n"` or `gs send dev1 "\x03"`.
+4. For request/response devices, ask once: `gs ask dev1 "AT\r\n"`; add `-t 1.5 -l 5` when the response needs more time or fewer lines.
+5. Check liveness before expecting new output: `gs status dev1`.
+6. Read cached output without consuming it: `gs read dev1 -n 200`.
+7. Poll only new cached output: `gs check dev1 -n 200`.
+8. Reset output state when needed: `gs clear dev1`.
+9. Use one foreground or bridge mode only when needed:
+   - `gs shell dev1` for foreground interactive access to the running session.
    - `gs tee dev1 serial.log` for foreground logging to terminal, file, and cache.
    - `gs tcp dev1 :7001` for a background TCP bridge.
    - `gs share dev1 COM20 COM21` for com0com virtual-port sharing.
-9. Inspect before cleanup: `gs status dev1` and `gs list`.
-10. Clean only the named session: `gs stop dev1`; use `gs rm dev1` to also delete state, cache, logs, and extracted tools.
+10. Inspect before cleanup: `gs status dev1` and `gs list`.
+11. Clean only the named session: `gs stop dev1`; use `gs rm dev1` to also delete state, cache, logs, and extracted tools.
 
 ## Command Reference
 
@@ -33,6 +34,8 @@ gs ports
 gs open dev1 COM3 -b 115200
 gs send dev1 "AT\r\n"
 gs send dev1 "\x03"
+gs ask dev1 "AT\r\n"
+gs ask dev1 "ATI\r\n" -t 1.5 -l 5
 gs read dev1 -n 200
 gs read dev1 --to serial-cache.log
 gs check dev1 -n 200
@@ -75,23 +78,25 @@ gs send dev1 "\x04"  # Ctrl+D
 
 Do not treat bare `^C` as special. It is ordinary payload text. In `gs shell`, use escaped line endings such as `AT\r\n` when the device expects CRLF.
 
+`gs ask <session> <data>` sends one payload and immediately reads fresh response data. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. When a session worker is running, `gs ask` sends through that worker and reads only newly cached output after the send.
+
 ## Cache Semantics
 
 `gs read` is a non-destructive cache viewer. It never advances a cursor, consumes bytes, or truncates the cache. Prefer `--to <file>` for large output so the CLI streams data into a file instead of dumping it to the terminal; combine `-n` with `--to` to export only the last N bytes.
 
 `gs check` is incremental polling. It reads from the saved check cursor and advances that cursor only to the bytes emitted. Use `--rewind <bytes>` to back up from the saved cursor, or `--from <offset>` to inspect from an absolute cache offset. `gs clear <session>` clears `cache.log` and resets the check cursor.
 
-Background owners that have a readable serial stream append output to the cache. This includes `gs tee`, `gs tcp`, and sharing/session workers when they own the stream.
+`gs open` starts a session worker that owns the physical serial port and appends output to the cache until `gs stop` or `gs rm`. Other owners with readable serial streams, including `gs tee`, `gs tcp`, and sharing workers, also append output to the cache while they own the stream.
 
 Run `gs status <session>` before expecting new output. `stopped` and `stale` sessions are not live serial readers, so `gs read` and `gs check` can only show bytes already present in `cache.log`. Do not keep polling `gs read` or `gs check` expecting new device output from a stopped or stale session.
 
-If the session is `stopped`, run `gs open <session> <port> -b <baud>` first to reopen the named session. Then start the actual monitor with a live owner such as `gs tee`, `gs shell`, `gs tcp`, or `gs share`. If the session is `stale`, clean it with `gs stop <session>`, then reopen it with `gs open`.
+If the session is `stopped`, run `gs open <session> <port> -b <baud>` to reopen it and restart the background reader. If the session is `stale`, clean it with `gs stop <session>`, then reopen it with `gs open`.
 
 ## Session State
 
 Named sessions let multiple agents or devices coexist. Always include the session name on mutating commands and never clean up all sessions for a named-session request.
 
-`gs open <session> <port>` records or updates local session state. Treat it as setup, not as the user's interactive terminal. Use `gs shell`, `gs tee`, `gs tcp`, or `gs share` for active ownership.
+`gs open <session> <port>` records or updates local session state, starts a background worker, and keeps the physical port open for that named session. `gs send`, `gs ask`, `gs shell`, and `gs read` then coordinate through that session instead of competing for the physical COM port.
 
 Session files live under the user config directory:
 
@@ -120,11 +125,11 @@ Use `gs log dev1` to print `worker.log`. Use `gs log dev1 --hub` to print `hub4c
 
 `stale` is not fatal. `gs stop dev1` should still clean that session's saved resources and should not fail merely because a saved process is gone. `gs rm dev1` performs the same live cleanup, then removes the session directory.
 
-When `worker_state` and `hub_state` are both `stopped`, nothing is appending serial output in the background. Reading the cache is still valid for old logs, but it is not a live device read. If the task needs fresh device output, reopen the session first, for example `gs open dev1 COM3 -b 115200`, then start `gs tee dev1 serial.log`, `gs shell dev1`, `gs tcp dev1 :7001`, or the appropriate sharing workflow before checking the cache again.
+When `worker_state` and `hub_state` are both `stopped`, nothing is appending serial output in the background. Reading the cache is still valid for old logs, but it is not a live device read. If the task needs fresh device output, reopen the session first, for example `gs open dev1 COM3 -b 115200`, before checking the cache again.
 
 ## Long-Running Modes
 
-Use `gs shell dev1` when an agent needs foreground interactive access. It prints serial output and writes stdin lines to the port. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
+Use `gs shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, and writes stdin lines to the port. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
 
 Use `gs tee dev1 serial.log` when the main goal is recording device output. It writes to terminal, the requested file, and the session cache.
 
@@ -169,7 +174,7 @@ Do not add remote registries, version solving, GitHub installs, package dependen
 | --- | --- |
 | Port missing | Run `gs ports`; verify Windows Device Manager; avoid assuming COM names. |
 | `Access is denied` or busy port | Check `gs status <session>`, stop only the owning named session, and close other terminals/tools. |
-| No output from `read` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` first, then start `gs tee`, `gs shell`, `gs tcp`, or `gs share` before expecting new output. |
+| No output from `read` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` first. If stale, run `gs stop <session>` and reopen it. |
 | Missed output with `check` | Use `gs check <session> --rewind <bytes>` or `--from <offset>`. |
 | Worker startup failed | Read `worker.log`; `gs status` may surface `worker_error`. |
 | hub4com/share problem | Read `hub4com.log`; confirm com0com `setupc.exe` is installed and discoverable. |

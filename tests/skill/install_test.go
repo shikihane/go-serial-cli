@@ -46,7 +46,7 @@ func TestInstallDefaultsToBundledSkill(t *testing.T) {
 	}
 }
 
-func TestBundledSkillExplainsStoppedSessionsBeforeReading(t *testing.T) {
+func TestBundledSkillExplainsOpenStartsSessionWorker(t *testing.T) {
 	dst := t.TempDir()
 
 	if _, err := skill.Install(skill.InstallOptions{To: dst}); err != nil {
@@ -60,10 +60,10 @@ func TestBundledSkillExplainsStoppedSessionsBeforeReading(t *testing.T) {
 	}
 	text := string(data)
 	for _, want := range []string{
-		"Run `gs status <session>` before expecting new output",
-		"`stopped` and `stale` sessions are not live serial readers",
-		"Do not keep polling `gs read` or `gs check` expecting new device output",
-		"run `gs open <session> <port> -b <baud>` first",
+		"`gs open` starts a session worker",
+		"keeps the physical port open",
+		"`gs send`, `gs ask`, `gs shell`, and `gs read` then coordinate through that session",
+		"Exiting shell leaves the background session worker running",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bundled skill does not contain %q", want)

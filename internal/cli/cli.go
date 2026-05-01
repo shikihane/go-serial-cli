@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -46,6 +47,7 @@ type AppDeps struct {
 	Store                 session.Store
 	ListPorts             func() ([]string, error)
 	SendSerial            func(port string, baud int, data string) error
+	AskSerial             func(opts serialcmd.AskOptions) error
 	SendSession           func(address string, data string) error
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
@@ -80,6 +82,8 @@ func (a *App) Run(args []string, out io.Writer) error {
 		return a.runOpen(args[1:], out)
 	case "send":
 		return a.runSend(args[1:], out)
+	case "ask":
+		return a.runAsk(args[1:], out)
 	case "read":
 		return a.runRead(args[1:], out)
 	case "check":
@@ -173,6 +177,7 @@ func DefaultDeps() (AppDeps, error) {
 		Store:                 store,
 		ListPorts:             serialcmd.Ports,
 		SendSerial:            serialcmd.Send,
+		AskSerial:             serialcmd.Ask,
 		SendSession:           serialcmd.SendToSession,
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
@@ -297,27 +302,68 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 		return errors.New("baud rate must be positive")
 	}
 	if a.deps.Store.Dir != "" {
-		var oldState session.State
-		hasOldState := false
 		if loadedState, err := a.deps.Store.Load(name); err == nil {
-			oldState = loadedState
-			hasOldState = true
-			if err := a.stopLiveResources(oldState); err != nil {
+			if err := a.stopLiveResources(loadedState); err != nil {
 				return err
 			}
 		}
-		tcpAddress := ""
-		status := session.StatusConfigured
-		if hasOldState && oldState.TCPAddress != "" {
-			tcpAddress = oldState.TCPAddress
-			status = session.StatusTCP
+		state := session.State{Name: name, Port: port, Baud: baud, Status: session.StatusConfigured}
+		if a.deps.ReserveControlAddress != nil {
+			controlAddress, err := a.deps.ReserveControlAddress()
+			if err != nil {
+				return err
+			}
+			state.ControlAddress = controlAddress
 		}
-		state := session.State{Name: name, Port: port, Baud: baud, Status: status, TCPAddress: tcpAddress}
 		if err := a.deps.Store.Save(state); err != nil {
+			return err
+		}
+		if err := a.startSessionWorker(name); err != nil {
 			return err
 		}
 	}
 	_, _ = fmt.Fprintf(out, "session %s: %s at %d baud\n", name, port, baud)
+	return nil
+}
+
+func (a *App) startSessionWorker(name string) error {
+	if a.deps.StartWorker == nil {
+		return nil
+	}
+	state, err := a.deps.Store.Load(name)
+	if err != nil {
+		return err
+	}
+	pid, err := a.deps.StartWorker(name)
+	if err != nil {
+		return err
+	}
+	state, err = a.deps.Store.Load(name)
+	if err != nil {
+		return err
+	}
+	state.WorkerPID = pid
+	if err := a.deps.Store.Save(state); err != nil {
+		return err
+	}
+	if state.ControlAddress == "" || a.deps.WaitForControl == nil {
+		return nil
+	}
+	if err := a.deps.WaitForControl(state.ControlAddress); err != nil {
+		startupErr := a.workerStartupErrorFromLog(name, pid, "session")
+		if startupErr == nil {
+			startupErr = err
+		}
+		if a.deps.StopProcess != nil && (a.deps.IsProcessRunning == nil || a.deps.IsProcessRunning(pid)) {
+			_ = a.deps.StopProcess(pid)
+		}
+		state.WorkerPID = 0
+		state.ControlAddress = ""
+		if saveErr := a.deps.Store.Save(state); saveErr != nil {
+			return errors.Join(startupErr, saveErr)
+		}
+		return startupErr
+	}
 	return nil
 }
 
@@ -352,6 +398,135 @@ func (a *App) runSend(args []string, out io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(out, "sent %d bytes to %s\n", len(args[1]), name)
 	return nil
+}
+
+func (a *App) runAsk(args []string, out io.Writer) error {
+	if len(args) < 2 {
+		return errors.New("usage: gs ask <session> <data> [-t seconds] [-l lines]")
+	}
+	name := args[0]
+	if err := session.ValidateName(name); err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	timeoutSeconds := fs.Float64("t", 0.5, "read response window in seconds")
+	maxLines := fs.Int("l", 50, "print the last N response lines; 0 means unlimited")
+	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: gs ask <session> <data> [-t seconds] [-l lines]")
+	}
+	if *timeoutSeconds <= 0 {
+		return errors.New("ask timeout must be positive")
+	}
+	if *maxLines < 0 {
+		return errors.New("ask line limit must not be negative")
+	}
+	if a.deps.Store.Dir == "" {
+		if a.deps.AskSerial == nil {
+			_, _ = fmt.Fprintln(out, "serial ask is unavailable")
+			return nil
+		}
+		return a.deps.AskSerial(serialcmd.AskOptions{
+			Data:     args[1],
+			Timeout:  time.Duration(*timeoutSeconds * float64(time.Second)),
+			MaxLines: *maxLines,
+			Output:   out,
+		})
+	}
+	state, err := a.deps.Store.Load(name)
+	if err != nil {
+		return err
+	}
+	if state.Paused {
+		return ErrSessionPaused
+	}
+	if address, ok, err := sessionDialAddress(state); err != nil {
+		return err
+	} else if ok {
+		if a.deps.SendSession == nil {
+			return errors.New("session sender is unavailable")
+		}
+		return a.askViaSessionWorker(state, address, args[1], time.Duration(*timeoutSeconds*float64(time.Second)), *maxLines, out)
+	}
+	if state.Status == session.StatusSharing {
+		return errors.New("shared session control channel is unavailable; run gs share <session> <virtual-port>... again")
+	}
+	if a.deps.AskSerial == nil {
+		return errors.New("serial ask is unavailable")
+	}
+	return a.deps.AskSerial(serialcmd.AskOptions{
+		Port:      state.Port,
+		Baud:      state.Baud,
+		Data:      args[1],
+		Timeout:   time.Duration(*timeoutSeconds * float64(time.Second)),
+		MaxLines:  *maxLines,
+		Output:    out,
+		CachePath: a.deps.Store.CachePath(name),
+	})
+}
+
+func (a *App) askViaSessionWorker(state session.State, address string, data string, timeout time.Duration, maxLines int, out io.Writer) error {
+	cachePath := a.deps.Store.CachePath(state.Name)
+	start := cacheSize(cachePath)
+	if err := a.deps.SendSession(address, data); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	next := start
+	var response bytes.Buffer
+	for {
+		end, err := copyCacheBytes(cachePath, &response, next)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		next = end
+		if time.Now().After(deadline) {
+			_, err := out.Write(lastLines(response.Bytes(), maxLines))
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func cacheSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func copyCacheBytes(path string, out io.Writer, start int64) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return start, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return start, err
+	}
+	written, err := io.Copy(out, f)
+	return start + written, err
+}
+
+func lastLines(data []byte, maxLines int) []byte {
+	if maxLines <= 0 {
+		return data
+	}
+	lines := 0
+	for i := len(data) - 1; i >= 0; i-- {
+		if data[i] != '\n' {
+			continue
+		}
+		lines++
+		if lines > maxLines {
+			return data[i+1:]
+		}
+	}
+	return data
 }
 
 func teeOutput(out io.Writer, path string) (io.Writer, func(), error) {
@@ -817,17 +992,26 @@ func (a *App) runTCP(args []string, out io.Writer) error {
 			return err
 		}
 		previousState := state
-		if err := a.stopLiveResources(state); err != nil {
-			return err
+		preserveShareResources := state.Status == session.StatusSharing && (len(state.VirtualPorts) > 0 || len(state.HubPorts) > 0 || state.HubPID != 0)
+		if preserveShareResources {
+			if err := a.stopProcessesOnly(state); err != nil {
+				return err
+			}
+			state.WorkerPID = 0
+			state.HubPID = 0
+		} else {
+			if err := a.stopLiveResources(state); err != nil {
+				return err
+			}
+			state.VirtualPorts = nil
+			state.HubPorts = nil
+			state.HubPID = 0
+			state.Status = session.StatusTCP
 		}
-		state.Status = session.StatusTCP
 		state.Paused = false
 		state.TCPAddress = listenAddress
 		state.ControlAddress = ""
-		state.VirtualPorts = nil
-		state.HubPorts = nil
 		state.WorkerPID = 0
-		state.HubPID = 0
 		if err := a.deps.Store.Save(state); err != nil {
 			return err
 		}
@@ -845,7 +1029,11 @@ func (a *App) runTCP(args []string, out io.Writer) error {
 				return err
 			}
 			if a.deps.IsProcessRunning != nil {
-				if err := a.waitForTCPWorkerStartup(name, pid); err != nil {
+				startMode := "tcp"
+				if preserveShareResources {
+					startMode = "share"
+				}
+				if err := a.waitForWorkerListenStartup(name, pid, startMode); err != nil {
 					if a.deps.StopProcess != nil {
 						_ = a.deps.StopProcess(pid)
 					}
@@ -938,6 +1126,31 @@ func (a *App) runShare(args []string, out io.Writer) error {
 	return nil
 }
 
+func (a *App) stopProcessesOnly(state session.State) error {
+	var stopErr error
+	if a.deps.StopProcess == nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	for _, pid := range []int{state.WorkerPID, state.HubPID} {
+		if pid == 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if a.deps.IsProcessRunning != nil && !a.deps.IsProcessRunning(pid) {
+			continue
+		}
+		if err := a.deps.StopProcess(pid); err != nil {
+			stopErr = errors.Join(stopErr, err)
+			continue
+		}
+		if err := a.waitForProcessExit(pid); err != nil {
+			stopErr = errors.Join(stopErr, err)
+		}
+	}
+	return stopErr
+}
+
 func (a *App) stopLiveResources(state session.State) error {
 	var stopErr error
 	if a.deps.StopProcess != nil {
@@ -991,10 +1204,10 @@ func (a *App) runWorkerAuto(name string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if state.TCPAddress != "" {
-		return a.runWorkerTCP(name, out)
-	}
 	if len(state.VirtualPorts) == 0 {
+		if state.TCPAddress != "" {
+			return a.runWorkerTCP(name, out)
+		}
 		return a.runWorkerSession(name, out)
 	}
 	return a.runWorkerShare(name, out)
@@ -1078,13 +1291,18 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 	}
 	if len(state.HubPorts) > 0 {
 		if a.deps.RunShareBridge != nil {
+			controlAddress := state.ControlAddress
+			if controlAddress == "" {
+				controlAddress = state.TCPAddress
+			}
 			return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 				return a.deps.RunShareBridge(serialcmd.ShareBridgeOptions{
 					PhysicalPort:   state.Port,
 					HubPorts:       append([]string(nil), state.HubPorts...),
 					Baud:           state.Baud,
 					CachePath:      a.deps.Store.CachePath(name),
-					ControlAddress: state.ControlAddress,
+					ControlAddress: controlAddress,
+					TCPAddress:     state.TCPAddress,
 				})
 			})
 		}
@@ -1234,8 +1452,8 @@ func tcpListenAddressToDialAddress(address string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-func (a *App) waitForTCPWorkerStartup(name string, pid int) error {
-	startMarker := fmt.Sprintf("worker start mode=tcp pid=%d", pid)
+func (a *App) waitForWorkerListenStartup(name string, pid int, mode string) error {
+	startMarker := fmt.Sprintf("worker start mode=%s pid=%d", mode, pid)
 	deadline := time.Now().Add(2 * time.Second)
 	logPath := a.deps.Store.WorkerLogPath(name)
 	for time.Now().Before(deadline) {
@@ -1269,7 +1487,7 @@ func (a *App) waitForTCPWorkerStartup(name string, pid int) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("wait for tcp worker %d to listen timed out", pid)
+	return fmt.Errorf("wait for %s worker %d to listen timed out", mode, pid)
 }
 
 func (a *App) workerStartupErrorFromLog(name string, pid int, mode string) error {
@@ -1568,6 +1786,7 @@ Usage:
   gs ports
   gs open <session> <port> [-b baud]
   gs send <session> <data>
+  gs ask <session> <data> [-t seconds] [-l lines]
   gs read <session> [-n count] [--to file]
   gs check <session> [-n count] [--from offset] [--rewind count] [--to file]
   gs clear <session>

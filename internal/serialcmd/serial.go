@@ -30,6 +30,17 @@ type SerialPort interface {
 	io.ReadWriteCloser
 }
 
+type AskOptions struct {
+	Port      string
+	Baud      int
+	Data      string
+	Timeout   time.Duration
+	MaxLines  int
+	Output    io.Writer
+	CachePath string
+	OpenPort  func(port string, baud int) (SerialPort, error)
+}
+
 type TCPBridgeOptions struct {
 	ListenAddress string
 	Port          string
@@ -56,6 +67,7 @@ type ShareBridgeOptions struct {
 	Baud           int
 	CachePath      string
 	ControlAddress string
+	TCPAddress     string
 	Stop           <-chan struct{}
 	OpenPort       func(port string, baud int) (SerialPort, error)
 }
@@ -95,6 +107,105 @@ func Send(port string, baud int, data string) error {
 		return fmt.Errorf("write serial port %s: short write %d/%d", port, n, len(payload))
 	}
 	return err
+}
+
+func Ask(opts AskOptions) error {
+	if opts.Port == "" {
+		return errors.New("port is required")
+	}
+	if opts.Baud <= 0 {
+		return errors.New("baud must be positive")
+	}
+	if opts.Timeout <= 0 {
+		return errors.New("ask timeout must be positive")
+	}
+	if opts.MaxLines < 0 {
+		return errors.New("ask line limit must not be negative")
+	}
+	if opts.Output == nil {
+		opts.Output = io.Discard
+	}
+	openPort := opts.OpenPort
+	if openPort == nil {
+		openPort = openSerialPort
+	}
+
+	p, err := openPort(opts.Port, opts.Baud)
+	if err != nil {
+		return diag.SerialOpenError(opts.Port, err)
+	}
+	defer p.Close()
+
+	output, closeOutput, err := streamOutput(StreamOptions{Output: opts.Output, CachePath: opts.CachePath})
+	if err != nil {
+		return err
+	}
+	defer closeOutput()
+
+	payload, err := parsePayload(opts.Data)
+	if err != nil {
+		return err
+	}
+	if err := writePayloadToPort(payload, p, opts.Port); err != nil {
+		return err
+	}
+	return readAskResponse(p, output, opts.Port, opts.Timeout, opts.MaxLines)
+}
+
+func readAskResponse(port SerialPort, output io.Writer, portName string, timeout time.Duration, maxLines int) error {
+	type readResult struct {
+		data []byte
+		n    int
+		err  error
+	}
+	results := make(chan readResult, 1)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	response := make([]byte, 0, 4096)
+
+	for {
+		go func() {
+			buf := make([]byte, 4096)
+			n, err := port.Read(buf)
+			results <- readResult{data: buf[:n], n: n, err: err}
+		}()
+
+		select {
+		case <-timer.C:
+			_ = port.Close()
+			<-results
+			_, err := output.Write(lastLines(response, maxLines))
+			return err
+		case result := <-results:
+			if result.n > 0 {
+				response = append(response, result.data...)
+			}
+			if result.err != nil {
+				if errors.Is(result.err, io.EOF) {
+					_, writeErr := output.Write(lastLines(response, maxLines))
+					return writeErr
+				}
+				return fmt.Errorf("read serial port %s: %w", portName, result.err)
+			}
+		}
+	}
+}
+
+func lastLines(data []byte, maxLines int) []byte {
+	if maxLines <= 0 {
+		return data
+	}
+	lines := 0
+	for i := len(data) - 1; i >= 0; i-- {
+		if data[i] != '\n' {
+			continue
+		}
+		lines++
+		if lines > maxLines {
+			return data[i+1:]
+		}
+	}
+	return data
 }
 
 func Stream(opts StreamOptions) error {
@@ -303,23 +414,33 @@ func ShareBridge(opts ShareBridgeOptions) error {
 	bridge.startHubWriters()
 	defer bridge.closeClients()
 
-	var listener net.Listener
+	var listeners []net.Listener
 	if opts.ControlAddress != "" {
-		listener, err = net.Listen("tcp", opts.ControlAddress)
+		listener, err := net.Listen("tcp", opts.ControlAddress)
 		if err != nil {
 			return err
 		}
+		listeners = append(listeners, listener)
+		defer listener.Close()
+	}
+	if opts.TCPAddress != "" && opts.TCPAddress != opts.ControlAddress {
+		listener, err := net.Listen("tcp", opts.TCPAddress)
+		if err != nil {
+			return err
+		}
+		listeners = append(listeners, listener)
 		defer listener.Close()
 	}
 
-	errCh := make(chan error, len(endpoints)+2)
+	errCh := make(chan error, len(endpoints)+len(listeners)+1)
 	for i := range endpoints {
 		endpoint := endpoints[i]
 		go func() {
 			errCh <- bridge.copyEndpointToOthers(endpoint)
 		}()
 	}
-	if listener != nil {
+	for _, listener := range listeners {
+		listener := listener
 		go func() {
 			errCh <- bridge.acceptControlClients(listener)
 		}()
@@ -327,7 +448,7 @@ func ShareBridge(opts ShareBridgeOptions) error {
 	if opts.Stop != nil {
 		go func() {
 			<-opts.Stop
-			if listener != nil {
+			for _, listener := range listeners {
 				_ = listener.Close()
 			}
 			bridge.close()

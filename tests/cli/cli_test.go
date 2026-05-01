@@ -191,6 +191,7 @@ func TestTopLevelCommandsAreRecognized(t *testing.T) {
 		{"-v"},
 		{"open", "dev1", "COM3", "-b", "115200"},
 		{"send", "dev1", "AT\\r\\n"},
+		{"ask", "dev1", "AT\\r\\n"},
 		{"read", "dev1", "-n", "200"},
 		{"check", "dev1", "-n", "200"},
 		{"clear", "dev1"},
@@ -740,7 +741,18 @@ func TestCommandsRequireSessionName(t *testing.T) {
 func TestOpenStoresNamedSession(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
-	app := cli.New(cli.AppDeps{Store: store})
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		ReserveControlAddress: func() (string, error) {
+			return "127.0.0.1:7002", nil
+		},
+		StartWorker: func(name string) (int, error) {
+			return 4242, nil
+		},
+		WaitForControl: func(address string) error {
+			return nil
+		},
+	})
 
 	if err := app.Run([]string{"open", "dev1", "COM3", "-b", "115200"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -755,18 +767,36 @@ func TestOpenStoresNamedSession(t *testing.T) {
 	}
 }
 
-func TestOpenDoesNotStartSessionWorkerOrHoldPort(t *testing.T) {
+func TestOpenStartsSessionWorkerAndRecordsControlAddress(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
+	var events []string
 	app := cli.New(cli.AppDeps{
 		Store: store,
 		ReserveControlAddress: func() (string, error) {
-			t.Fatal("open should not reserve a control listener")
-			return "", nil
+			events = append(events, "reserve")
+			return "127.0.0.1:7002", nil
 		},
 		StartWorker: func(name string) (int, error) {
-			t.Fatalf("open should not start worker for %q", name)
-			return 0, nil
+			events = append(events, "start")
+			if name != "dev1" {
+				t.Fatalf("worker session = %q, want dev1", name)
+			}
+			state, err := store.Load(name)
+			if err != nil {
+				t.Fatalf("Load in StartWorker returned error: %v", err)
+			}
+			if state.ControlAddress != "127.0.0.1:7002" || state.Port != "COM3" || state.Baud != 115200 {
+				t.Fatalf("worker saw state = %#v", state)
+			}
+			return 4242, nil
+		},
+		WaitForControl: func(address string) error {
+			events = append(events, "wait")
+			if address != "127.0.0.1:7002" {
+				t.Fatalf("wait address = %q, want 127.0.0.1:7002", address)
+			}
+			return nil
 		},
 	})
 
@@ -778,30 +808,42 @@ func TestOpenDoesNotStartSessionWorkerOrHoldPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.ControlAddress != "" || got.WorkerPID != 0 || got.Status != session.StatusConfigured {
+	if !reflect.DeepEqual(events, []string{"reserve", "start", "wait"}) {
+		t.Fatalf("events = %#v", events)
+	}
+	if got.ControlAddress != "127.0.0.1:7002" || got.WorkerPID != 4242 || got.Status != session.StatusConfigured {
 		t.Fatalf("state = %#v", got)
 	}
 }
 
-func TestOpenPreservesExistingTCPForwarding(t *testing.T) {
+func TestOpenStopsExistingLiveResourcesAndStartsSessionWorker(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
-	if err := store.Save(session.State{Name: "dev1", Port: "COM4", Baud: 9600, Status: session.StatusTCP, TCPAddress: "127.0.0.1:47017"}); err != nil {
+	if err := store.Save(session.State{Name: "dev1", Port: "COM4", Baud: 9600, Status: session.StatusTCP, TCPAddress: "127.0.0.1:47017", WorkerPID: 47017}); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
+	var events []string
 	app := cli.New(cli.AppDeps{
 		Store: store,
-		ReserveControlAddress: func() (string, error) {
-			t.Fatal("open should not reserve a control listener when tcp forwarding already exists")
-			return "", nil
-		},
-		StartWorker: func(name string) (int, error) {
-			t.Fatalf("open should not restart worker for %q", name)
-			return 0, nil
+		StopProcess: func(pid int) error {
+			events = append(events, fmt.Sprintf("stop:%d", pid))
+			return nil
 		},
 		IsProcessRunning: func(pid int) bool {
 			return pid == 47017
 		},
+		ReserveControlAddress: func() (string, error) {
+			events = append(events, "reserve")
+			return "127.0.0.1:7002", nil
+		},
+		StartWorker: func(name string) (int, error) {
+			events = append(events, "start")
+			return 4242, nil
+		},
+		WaitForControl: func(address string) error {
+			events = append(events, "wait")
+			return nil
+		},
 	})
 
 	if err := app.Run([]string{"open", "dev1", "COM3", "-b", "115200"}, &out); err != nil {
@@ -812,34 +854,55 @@ func TestOpenPreservesExistingTCPForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.Port != "COM3" || got.Baud != 115200 || got.Status != session.StatusTCP || got.TCPAddress != "127.0.0.1:47017" || got.WorkerPID != 0 {
+	if !reflect.DeepEqual(events, []string{"stop:47017", "reserve", "start", "wait"}) {
+		t.Fatalf("events = %#v", events)
+	}
+	if got.Port != "COM3" || got.Baud != 115200 || got.Status != session.StatusConfigured || got.TCPAddress != "" || got.WorkerPID != 4242 || got.ControlAddress != "127.0.0.1:7002" {
 		t.Fatalf("state = %#v", got)
 	}
 }
 
-func TestOpenIgnoresUnavailableSerialPortUntilLiveCommand(t *testing.T) {
+func TestOpenReturnsWorkerStartupErrorAndClearsLiveState(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
+	workerPID := 10565
 	app := cli.New(cli.AppDeps{
 		Store: store,
 		ReserveControlAddress: func() (string, error) {
-			t.Fatal("open should not reserve a control listener")
-			return "", nil
+			return "127.0.0.1:10565", nil
 		},
 		StartWorker: func(name string) (int, error) {
-			t.Fatalf("open should not start worker for %q", name)
-			return 0, nil
+			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=session pid=10565 control=127.0.0.1:10565"); err != nil {
+				t.Fatalf("AppendLog start returned error: %v", err)
+			}
+			if err := session.AppendLog(store.WorkerLogPath(name), "worker retry error=\"open serial port COM5: Serial port not found\" delay=250ms"); err != nil {
+				t.Fatalf("AppendLog retry returned error: %v", err)
+			}
+			return workerPID, nil
+		},
+		WaitForControl: func(address string) error {
+			return errors.New("wait for session control 127.0.0.1:10565: connection refused")
+		},
+		IsProcessRunning: func(pid int) bool {
+			return pid == workerPID
+		},
+		StopProcess: func(pid int) error {
+			return nil
 		},
 	})
 
-	if err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out); err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	err := app.Run([]string{"open", "dev1", "COM5", "-b", "3000000"}, &out)
+	if err == nil {
+		t.Fatal("expected worker startup error")
+	}
+	if !strings.Contains(err.Error(), "open serial port COM5: Serial port not found") {
+		t.Fatalf("error = %q, want worker retry error", err)
 	}
 	got, err := store.Load("dev1")
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.Port != "COM5" || got.Baud != 3000000 || got.WorkerPID != 0 || got.ControlAddress != "" {
+	if got.Port != "COM5" || got.Baud != 3000000 || got.WorkerPID != 0 || got.ControlAddress != "" || got.TCPAddress != "" {
 		t.Fatalf("state = %#v", got)
 	}
 }
@@ -999,6 +1062,131 @@ func TestSendUsesTCPForwarderWhenTCPWorkerOwnsPort(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("SendSession was not called")
+	}
+}
+
+func TestAskUsesNamedSessionWithDefaults(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	called := false
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		AskSerial: func(opts serialcmd.AskOptions) error {
+			called = true
+			if opts.Port != "COM3" || opts.Baud != 115200 || opts.Data != "AT\\r\\n" {
+				t.Fatalf("ask opts = %#v", opts)
+			}
+			if opts.Timeout != 500*time.Millisecond {
+				t.Fatalf("timeout = %v, want 500ms", opts.Timeout)
+			}
+			if opts.MaxLines != 50 {
+				t.Fatalf("max lines = %d, want 50", opts.MaxLines)
+			}
+			if opts.Output != &out {
+				t.Fatal("ask should write serial response to command output")
+			}
+			if opts.CachePath != store.CachePath("dev1") {
+				t.Fatalf("cache path = %q, want %q", opts.CachePath, store.CachePath("dev1"))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("AskSerial was not called")
+	}
+}
+
+func TestAskAcceptsTimeoutAndLineLimit(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		AskSerial: func(opts serialcmd.AskOptions) error {
+			if opts.Timeout != 1500*time.Millisecond {
+				t.Fatalf("timeout = %v, want 1.5s", opts.Timeout)
+			}
+			if opts.MaxLines != 3 {
+				t.Fatalf("max lines = %d, want 3", opts.MaxLines)
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n", "-t", "1.5", "-l", "3"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestAskUsesWorkerControlChannelAndReadsNewCache(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSession: func(address string, data string) error {
+			if address != "127.0.0.1:7002" || data != "AT\\r\\n" {
+				t.Fatalf("send args = %q %q", address, data)
+			}
+			return os.WriteFile(store.CachePath("dev1"), []byte("old\nOK\r\n"), 0o644)
+		},
+		AskSerial: func(opts serialcmd.AskOptions) error {
+			t.Fatal("AskSerial should not open the physical port when a worker owns it")
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n", "-t", "0.01"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "OK\r\n" {
+		t.Fatalf("output = %q, want worker cache response", out.String())
+	}
+}
+
+func TestAskWorkerControlChannelReturnsLastLines(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSession: func(address string, data string) error {
+			return os.WriteFile(store.CachePath("dev1"), []byte("old\none\r\ntwo\r\nthree\r\n"), 0o644)
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n", "-t", "0.01", "-l", "2"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "two\r\nthree\r\n" {
+		t.Fatalf("output = %q, want last two lines", out.String())
 	}
 }
 
@@ -1605,6 +1793,44 @@ func TestWorkerShareUsesGoBridgeWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestWorkerAutoKeepsSharedSessionWhenTCPAddressIsSet(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{
+		Name:         "dev1",
+		Port:         "COM3",
+		Baud:         115200,
+		Status:       session.StatusSharing,
+		VirtualPorts: []string{"COM20"},
+		HubPorts:     []string{"CNCB20"},
+		TCPAddress:   ":7001",
+	}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	called := false
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		RunShareBridge: func(opts serialcmd.ShareBridgeOptions) error {
+			called = true
+			if opts.ControlAddress != ":7001" {
+				t.Fatalf("ControlAddress = %q, want :7001", opts.ControlAddress)
+			}
+			return nil
+		},
+		BridgeTCP: func(opts serialcmd.TCPBridgeOptions) error {
+			t.Fatal("shared session should not use exclusive TCP bridge")
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"worker", "run", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("RunShareBridge was not called")
+	}
+}
+
 func TestWorkerShareRetriesUnexpectedHubExit(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -1845,7 +2071,7 @@ func TestTCPReturnsWorkerStartupErrorAndClearsPID(t *testing.T) {
 	}
 }
 
-func TestTCPClearsShareResourcesAndStopsPreviousWorker(t *testing.T) {
+func TestTCPPreservesShareResources(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -1867,12 +2093,11 @@ func TestTCPClearsShareResourcesAndStopsPreviousWorker(t *testing.T) {
 			return true
 		},
 		StopProcess: func(pid int) error {
-			events = append(events, "stop")
+			events = append(events, fmt.Sprintf("stop:%d", pid))
 			return nil
 		},
 		RemoveVirtualPorts: func(pairs []cli.VirtualPortPair) error {
-			events = append(events, "remove")
-			wantPairs(t, pairs, []cli.VirtualPortPair{{Public: "COM20", Hub: "CNCB20"}})
+			t.Fatalf("tcp should not remove existing virtual ports: %#v", pairs)
 			return nil
 		},
 		StartWorker: func(name string) (int, error) {
@@ -1881,10 +2106,13 @@ func TestTCPClearsShareResourcesAndStopsPreviousWorker(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load in StartWorker returned error: %v", err)
 			}
-			if state.WorkerPID != 0 || state.HubPID != 0 || len(state.VirtualPorts) != 0 || len(state.HubPorts) != 0 {
-				t.Fatalf("old live resources were saved before start: %#v", state)
+			if state.WorkerPID != 0 || state.HubPID != 0 || !reflect.DeepEqual(state.VirtualPorts, []string{"COM20"}) || !reflect.DeepEqual(state.HubPorts, []string{"CNCB20"}) {
+				t.Fatalf("share resources were not preserved before start: %#v", state)
 			}
-			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=tcp pid=7001 listen=:7001"); err != nil {
+			if state.Status != session.StatusSharing || state.TCPAddress != ":7001" {
+				t.Fatalf("tcp should preserve sharing mode and record listen address before start: %#v", state)
+			}
+			if err := session.AppendLog(store.WorkerLogPath(name), "worker start mode=share pid=7001"); err != nil {
 				t.Fatalf("AppendLog start returned error: %v", err)
 			}
 			if err := session.AppendLog(store.WorkerLogPath(name), "worker ready listen=:7001"); err != nil {
@@ -1897,14 +2125,14 @@ func TestTCPClearsShareResourcesAndStopsPreviousWorker(t *testing.T) {
 	if err := app.Run([]string{"tcp", "dev1", ":7001"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if !reflect.DeepEqual(events, []string{"stop", "stop", "remove", "start"}) {
+	if !reflect.DeepEqual(events, []string{"stop:111", "stop:112", "start"}) {
 		t.Fatalf("events = %#v", events)
 	}
 	got, err := store.Load("dev1")
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got.TCPAddress != ":7001" || got.WorkerPID != 7001 || got.HubPID != 0 || len(got.VirtualPorts) != 0 || len(got.HubPorts) != 0 {
+	if got.Status != session.StatusSharing || got.TCPAddress != ":7001" || got.WorkerPID != 7001 || got.HubPID != 0 || !reflect.DeepEqual(got.VirtualPorts, []string{"COM20"}) || !reflect.DeepEqual(got.HubPorts, []string{"CNCB20"}) {
 		t.Fatalf("state = %#v", got)
 	}
 }

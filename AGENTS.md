@@ -16,6 +16,8 @@ gs open dev1 COM3 -b 115200
 gs share dev1 COM20 COM21
 gs send dev1 "AT\r\n"
 gs send dev1 "\x03"
+gs ask dev1 "AT\r\n"
+gs ask dev1 "ATI\r\n" -t 1.5 -l 5
 gs read dev1 -n 200
 gs read dev1 --to serial-cache.log
 gs check dev1 -n 200
@@ -76,17 +78,19 @@ Use `go.bug.st/serial` for serial behavior. Do not shell out to PowerShell for c
 
 ## Current Behavior
 
-`gs open <session> <port>` stores a named serial session in the user config directory. It does not hold the port open.
+`gs open <session> <port>` stores a named serial session in the user config directory, starts a background session worker, and keeps the physical port open until `gs stop <session>` or `gs rm <session>`.
 
 `gs ports` enumerates ports through `go.bug.st/serial`.
 
-`gs send <session>` opens the named session port, writes one payload, and closes the port. Payloads support explicit escapes: `\r`, `\n`, `\t`, `\xNN` for one hexadecimal byte, and `\cX` for ASCII control characters. For example, `gs send dev1 "\x03"` and `gs send dev1 "\cC"` both send Ctrl+C, `gs send dev1 "\x1b"` sends ESC, and `gs send dev1 "\x04"` sends Ctrl+D. Do not treat bare `^C` as special; it should remain ordinary payload text.
+`gs send <session>` writes one payload through the named session worker when it is running. If no worker/control channel is available, it may open the named session port for that one write and close it. Payloads support explicit escapes: `\r`, `\n`, `\t`, `\xNN` for one hexadecimal byte, and `\cX` for ASCII control characters. For example, `gs send dev1 "\x03"` and `gs send dev1 "\cC"` both send Ctrl+C, `gs send dev1 "\x1b"` sends ESC, and `gs send dev1 "\x04"` sends Ctrl+D. Do not treat bare `^C` as special; it should remain ordinary payload text.
+
+`gs ask <session> <data>` sends one payload and immediately reads fresh response data for request/response devices. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. When a session worker is running, `gs ask` sends through that worker and reads only newly appended cache output after the send. Without a worker/control channel, it may open the named session port for the ask and append the response to the local cache.
 
 `gs read <session>` reads from that session's local cache file without consuming, truncating, or advancing any cursor. Background workers and `tee` append serial output to that cache when they own a readable serial stream. Large cache reads should use `gs read <session> --to <file>` so data is streamed into a file instead of dumped to the terminal; `-n` may be combined with `--to` to export only the last N bytes.
 
 `gs check <session>` is the incremental-read command. It reads from the saved check cursor and advances that cursor only to the bytes it emitted. Use `gs check <session> --rewind <bytes>` to back up if important output was missed, or `gs check <session> --from <offset>` to inspect from an absolute cache offset. `gs clear <session>` resets both cache contents and the check cursor.
 
-`gs shell <session>` opens the named session port and keeps it open in the foreground. It continuously prints serial output and writes stdin lines to the port. Use escaped line endings such as `AT\r\n` when the device expects CRLF; the same payload escapes as `gs send` apply to entered lines.
+`gs shell <session>` connects to the named session worker in the foreground when it is running. It continuously prints serial output and writes stdin lines to the port. Exiting shell must leave the background session worker running. Use escaped line endings such as `AT\r\n` when the device expects CRLF; the same payload escapes as `gs send` apply to entered lines.
 
 `gs tee <session> <file>` opens the named session port and keeps it open in the foreground. It continuously writes serial output to both the screen and the file, and also appends output to the local cache file used by `gs read <session>`.
 

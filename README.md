@@ -10,6 +10,41 @@ same device.
 For now, the tool should stay simple: one binary, short commands, local files for
 state and logs, and cleanup that only touches the session you named.
 
+## Quick start
+
+```bash
+gs version
+gs ports
+gs open dev1 COM3 -b 115200
+gs send dev1 "AT\r\n"
+gs ask dev1 "AT\r\n"
+gs read dev1 -n 200
+gs check dev1 -n 200
+gs stop dev1
+```
+
+`gs open` records a named session and starts a background worker that keeps the
+physical port open, reads serial output, and appends it to `cache.log`.
+Commands such as `send`, `ask`, `read`, `check`, and `shell` coordinate through
+that named session.
+
+```bash
+gs shell dev1
+gs tee dev1 serial.log
+gs tcp dev1 :7001
+gs share dev1 COM20 COM21
+```
+
+Clean up only the session you named:
+
+```bash
+gs stop dev1
+gs rm dev1
+```
+
+`stop` releases live resources and leaves the session files. `rm` performs the
+same live cleanup, then deletes that session's state, cache, and logs.
+
 ## Why Windows first
 
 Most industrial PCs, factory test stations, embedded benches, and vendor debug
@@ -234,58 +269,14 @@ Runtime dependencies depend on what you use:
 Download com0com and hub4com from:
 
 ```text
-https://com0com.com/
-https://sourceforge.net/projects/com0com/
+com0com project site: https://com0com.com/
+com0com SourceForge project: https://sourceforge.net/projects/com0com/
+hub4com SourceForge files: https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 Install the driver manually. `gs` should not silently install kernel drivers.
 This repository does not vendor or redistribute com0com installers or hub4com
 binaries.
-
-## Third-party tools and licenses
-
-`gs` is designed with respect for the projects it can integrate with. com0com
-made practical virtual COM-port workflows available on Windows, and hub4com
-provided the routing model that inspired `gs share` and remains useful as an
-external fallback. This project is grateful for that work.
-
-To keep licensing boundaries clear, this repository does not contain com0com or
-hub4com binaries, installers, batch files, or documentation copies. Users who
-choose to use those tools should download them from their upstream project and
-follow their licenses. The `gs` source code is intended to be licensed
-separately from those external tools.
-
-## Quick start
-
-```bash
-gs version
-gs ports
-gs open dev1 COM3 -b 115200
-gs send dev1 "AT\r\n"
-gs read dev1 -n 200
-gs check dev1 -n 200
-gs stop dev1
-```
-
-`gs open` records a named session. It does not mean the CLI is now your terminal.
-Use one active owner when you need live serial I/O:
-
-```bash
-gs shell dev1
-gs tee dev1 serial.log
-gs tcp dev1 :7001
-gs share dev1 COM20 COM21
-```
-
-Clean up only the session you named:
-
-```bash
-gs stop dev1
-gs rm dev1
-```
-
-`stop` releases live resources and leaves the session files. `rm` performs the
-same live cleanup, then deletes that session's state, cache, and logs.
 
 ## Command model
 
@@ -312,6 +303,8 @@ gs send dev1 "\x03"
 gs send dev1 "\cC"
 gs send dev1 "\x1b"
 gs send dev1 "\x04"
+gs ask dev1 "AT\r\n"
+gs ask dev1 "ATI\r\n" -t 1.5 -l 5
 ```
 
 Payloads support explicit escapes:
@@ -326,6 +319,11 @@ Payloads support explicit escapes:
 
 Bare forms such as `^C` are ordinary text. This keeps literal payloads
 unambiguous.
+
+`gs ask` sends one payload, then reads fresh serial response data for a short
+window. The default window is 0.5 seconds and the default output is the last 50
+response lines. Use `-t <seconds>` to change the window and `-l <lines>` to
+print the last N lines. `-l 0` disables the line limit.
 
 ### Reading cached output
 
@@ -358,10 +356,11 @@ gs tcp dev1 :7001
 gs share dev1 COM20 COM21
 ```
 
-`gs shell` keeps the named session open in the foreground, prints serial output,
-and writes stdin to the port. Use escaped line endings such as `AT\r\n` when the
-device expects CRLF. On Windows, one Ctrl+C sends byte `0x03` to the device; a
-second interrupt shortly after exits the shell.
+`gs shell` connects to the running named session in the foreground, prints serial
+output, and writes stdin to the port. Exiting shell leaves the background worker
+running. Use escaped line endings such as `AT\r\n` when the device expects CRLF.
+On Windows, one Ctrl+C sends byte `0x03` to the device; a second interrupt
+shortly after exits the shell.
 
 `gs tee` keeps the port open in the foreground and writes serial output to the
 terminal, the requested file, and the session cache.
@@ -487,8 +486,11 @@ flowchart TB
 The simple commands are short-lived:
 
 - `gs ports` asks `go.bug.st/serial` for available ports.
-- `gs open dev1 COM3 -b 115200` writes `state.json`.
-- `gs send dev1 ...` opens the configured port, writes bytes, and exits.
+- `gs open dev1 COM3 -b 115200` writes `state.json`, starts a background
+  session worker, and keeps the configured port open until `stop` or `rm`.
+- `gs send dev1 ...` sends bytes through the session worker when it is running.
+- `gs ask dev1 ...` sends bytes through the session worker when it is running,
+  then reads a short response window from newly cached output.
 - `gs read` and `gs check` read `cache.log`.
 
 The live modes keep something open:
@@ -574,15 +576,17 @@ Use `gs log <session>` for `worker.log`. Use `gs log <session> --hub` for
 
 When `worker_state` and `hub_state` are both `stopped`, nothing is appending
 fresh serial output in the background. `read` and `check` can still inspect old
-cached bytes, but they are not live device reads.
+cached bytes, but they are not live device reads. Run `gs open <session> <port>
+-b <baud>` to restart the session worker.
 
 ## Windows setup
 
 Install com0com manually before using `gs share`:
 
 ```text
-https://com0com.com/
-https://sourceforge.net/projects/com0com/
+com0com project site: https://com0com.com/
+com0com SourceForge project: https://sourceforge.net/projects/com0com/
+hub4com SourceForge files: https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 After installing com0com, make sure `setupc.exe` is on `PATH`, or installed in a
@@ -681,8 +685,22 @@ dist/
 | --- | --- |
 | Port missing | Run `gs ports`; verify Windows Device Manager; avoid assuming COM names. |
 | `Access is denied` or busy port | Check `gs status <session>`, stop only the owning named session, and close other terminals/tools. |
-| No output from `read` or `check` | Run `gs status <session>`; if stopped, start a live owner such as `gs shell`, `gs tee`, `gs tcp`, or `gs share`. |
+| No output from `read` or `check` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` to restart the session worker. If stale, run `gs stop <session>` and reopen it. |
 | Missed output with `check` | Use `gs check <session> --rewind <bytes>` or `--from <offset>`. |
 | Worker startup failed | Read `worker.log`; `gs status` may surface `worker_error`. |
 | hub4com/share problem | Read `hub4com.log`; confirm com0com `setupc.exe` is installed and discoverable. |
 | Stale PID | Run `gs stop <session>`; cleanup should handle missing processes. |
+
+## Acknowledgements and licenses
+
+The `gs` source code is released under the MIT License. See `LICENSE`.
+
+`gs` is designed with respect for the projects it can integrate with. Thanks to
+the com0com project for making practical virtual COM-port workflows available on
+Windows, and to the hub4com project for the serial routing model that inspired
+`gs share` and remains useful as an external fallback.
+
+To keep licensing boundaries clear, this repository does not contain com0com or
+hub4com binaries, installers, batch files, or documentation copies. Users who
+choose to use those tools should download them from their upstream project and
+follow their licenses.

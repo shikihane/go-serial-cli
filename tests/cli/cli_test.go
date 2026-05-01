@@ -1707,7 +1707,7 @@ func TestWorkerShareRetriesTransientStreamErrors(t *testing.T) {
 	}
 }
 
-func TestWorkerShareStartsHubForVirtualPorts(t *testing.T) {
+func TestWorkerShareRequiresBuiltInBridgeForVirtualPorts(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -1720,32 +1720,14 @@ func TestWorkerShareStartsHubForVirtualPorts(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	app := cli.New(cli.AppDeps{
-		Store: store,
-		StartHub: func(opts cli.HubOptions) (cli.ManagedProcess, error) {
-			if opts.SessionName != "dev1" || opts.PhysicalPort != "COM3" || opts.Baud != 115200 {
-				t.Fatalf("hub opts = %#v", opts)
-			}
-			if !reflect.DeepEqual(opts.HubPorts, []string{"CNCB20", "CNCB21"}) {
-				t.Fatalf("HubPorts = %#v", opts.HubPorts)
-			}
-			return cli.ManagedProcess{PID: 5151, Wait: func() error { return nil }}, nil
-		},
-		StreamSerial: func(opts serialcmd.StreamOptions) error {
-			t.Fatal("worker should not open the physical port while hub4com owns it")
-			return nil
-		},
-	})
+	app := cli.New(cli.AppDeps{Store: store})
 
-	if err := app.Run([]string{"worker", "share", "dev1"}, &out); err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	err := app.Run([]string{"worker", "share", "dev1"}, &out)
+	if err == nil {
+		t.Fatal("Run returned nil, want share bridge unavailable error")
 	}
-	got, err := store.Load("dev1")
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if got.HubPID != 5151 {
-		t.Fatalf("HubPID = %d, want 5151", got.HubPID)
+	if !strings.Contains(err.Error(), "share bridge is unavailable") {
+		t.Fatalf("error = %v, want share bridge unavailable", err)
 	}
 }
 
@@ -1778,10 +1760,6 @@ func TestWorkerShareUsesGoBridgeWhenAvailable(t *testing.T) {
 				t.Fatalf("CachePath = %q, want %q", opts.CachePath, store.CachePath("dev1"))
 			}
 			return nil
-		},
-		StartHub: func(opts cli.HubOptions) (cli.ManagedProcess, error) {
-			t.Fatal("StartHub should not be used when Go share bridge is available")
-			return cli.ManagedProcess{}, nil
 		},
 	})
 
@@ -1831,7 +1809,7 @@ func TestWorkerAutoKeepsSharedSessionWhenTCPAddressIsSet(t *testing.T) {
 	}
 }
 
-func TestWorkerShareRetriesUnexpectedHubExit(t *testing.T) {
+func TestWorkerShareRetriesUnexpectedBridgeExit(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -1848,12 +1826,12 @@ func TestWorkerShareRetriesUnexpectedHubExit(t *testing.T) {
 	var sleeps int
 	app := cli.New(cli.AppDeps{
 		Store: store,
-		StartHub: func(opts cli.HubOptions) (cli.ManagedProcess, error) {
+		RunShareBridge: func(opts serialcmd.ShareBridgeOptions) error {
 			starts++
 			if starts == 1 {
-				return cli.ManagedProcess{PID: 5151, Wait: func() error { return errors.New("hub exited") }}, nil
+				return errors.New("bridge exited")
 			}
-			return cli.ManagedProcess{PID: 5152, Wait: func() error { return nil }}, nil
+			return nil
 		},
 		RetrySleep: func(delay time.Duration) {
 			sleeps++
@@ -1864,14 +1842,14 @@ func TestWorkerShareRetriesUnexpectedHubExit(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if starts != 2 {
-		t.Fatalf("hub starts = %d, want 2", starts)
+		t.Fatalf("bridge starts = %d, want 2", starts)
 	}
 	if sleeps != 1 {
 		t.Fatalf("sleeps = %d, want 1", sleeps)
 	}
 }
 
-func TestWorkerShareAppendsLifecycleAndHubLogs(t *testing.T) {
+func TestWorkerShareAppendsLifecycleAndBridgeErrors(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{
@@ -1884,14 +1862,11 @@ func TestWorkerShareAppendsLifecycleAndHubLogs(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	waitErr := errors.New("hub exited")
+	waitErr := errors.New("bridge exited")
 	app := cli.New(cli.AppDeps{
 		Store: store,
-		StartHub: func(opts cli.HubOptions) (cli.ManagedProcess, error) {
-			if opts.LogPath != store.HubLogPath("dev1") {
-				t.Fatalf("LogPath = %q, want %q", opts.LogPath, store.HubLogPath("dev1"))
-			}
-			return cli.ManagedProcess{PID: 5151, Wait: func() error { return waitErr }}, nil
+		RunShareBridge: func(opts serialcmd.ShareBridgeOptions) error {
+			return waitErr
 		},
 	})
 
@@ -1907,8 +1882,7 @@ func TestWorkerShareAppendsLifecycleAndHubLogs(t *testing.T) {
 	got := string(data)
 	for _, want := range []string{
 		"worker start mode=share pid=",
-		"hub start pid=5151 ports=CNCB20,CNCB21",
-		"worker error hub exited",
+		"worker error bridge exited",
 		"worker exit",
 	} {
 		if !strings.Contains(got, want) {
@@ -2337,14 +2311,16 @@ func TestStatusShowsLiveResourceDetailsAndLogPaths(t *testing.T) {
 	for _, want := range []string{
 		"worker_pid: 123",
 		"worker_state: running",
-		"hub_pid: 456",
-		"hub_state: stale",
 		"tcp: :7001",
 		"worker_log: " + store.WorkerLogPath("dev1"),
-		"hub_log: " + store.HubLogPath("dev1"),
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output %q does not contain %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{"hub_pid:", "hub_state:", "hub_log:"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("status output %q should not contain %q", got, unwanted)
 		}
 	}
 }
@@ -2434,33 +2410,6 @@ func TestLogPrintsWorkerLog(t *testing.T) {
 
 	if got := out.String(); !strings.Contains(got, "worker start mode=session pid=123") {
 		t.Fatalf("log output %q does not contain worker log line", got)
-	}
-}
-
-func TestLogCanPrintHubLog(t *testing.T) {
-	var out bytes.Buffer
-	store := session.Store{Dir: t.TempDir()}
-	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, Status: session.StatusSharing}); err != nil {
-		t.Fatalf("Save returned error: %v", err)
-	}
-	if err := session.AppendLog(store.WorkerLogPath("dev1"), "worker log should not be printed"); err != nil {
-		t.Fatalf("AppendLog worker returned error: %v", err)
-	}
-	if err := session.AppendLog(store.HubLogPath("dev1"), "hub4com route started"); err != nil {
-		t.Fatalf("AppendLog hub returned error: %v", err)
-	}
-	app := cli.New(cli.AppDeps{Store: store})
-
-	if err := app.Run([]string{"log", "dev1", "--hub"}, &out); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	got := out.String()
-	if !strings.Contains(got, "hub4com route started") {
-		t.Fatalf("log output %q does not contain hub log line", got)
-	}
-	if strings.Contains(got, "worker log should not be printed") {
-		t.Fatalf("log output %q should not contain worker log line", got)
 	}
 }
 

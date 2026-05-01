@@ -396,6 +396,45 @@ func TestSessionServerCachesAndBroadcastsSerialOutput(t *testing.T) {
 	assertFileContent(t, cachePath, "OK\r\n")
 }
 
+func TestShareBridgeKeepsPhysicalPortOpenAndReadsAsyncOutput(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "cache.log")
+	physical := newMemorySerialPort()
+	hubA := newMemorySerialPort()
+	var physicalOpens int
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ShareBridge(ShareBridgeOptions{
+			PhysicalPort: "COM3",
+			HubPorts:     []string{"CNCB20"},
+			Baud:         115200,
+			CachePath:    cachePath,
+			Stop:         stop,
+			OpenPort: func(portName string, baud int) (SerialPort, error) {
+				if portName == "COM3" {
+					physicalOpens++
+					return physical, nil
+				}
+				if portName == "CNCB20" {
+					return hubA, nil
+				}
+				t.Fatalf("unexpected port open %s", portName)
+				return nil, nil
+			},
+		})
+	}()
+	defer stopShareBridge(t, stop, errCh)
+
+	physical.injectRead("BOOT\r\n")
+	if got := hubA.waitWritten(t); got != "BOOT\r\n" {
+		t.Fatalf("hub write = %q, want BOOT CRLF", got)
+	}
+	waitForFileContent(t, cachePath, "BOOT\r\n")
+	if physicalOpens != 1 {
+		t.Fatalf("physical opens = %d, want 1", physicalOpens)
+	}
+}
+
 func TestShareBridgeWritesPhysicalResponseToHubPortsAndCache(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "cache.log")
 	physical := newMemorySerialPort()

@@ -50,7 +50,6 @@ gs pause dev1
 gs resume dev1
 gs status dev1
 gs log dev1
-gs log dev1 --hub
 gs stop dev1
 gs rm dev1
 gs list
@@ -110,12 +109,11 @@ Important files:
 state.json
 cache.log
 worker.log
-hub4com.log
 ```
 
-Use `gs log dev1` to print `worker.log`. Use `gs log dev1 --hub` to print `hub4com.log` for share/hub4com diagnosis.
+Use `gs log dev1` to print `worker.log` for session and share diagnosis.
 
-`gs status dev1` reports worker and hub liveness as:
+`gs status dev1` reports worker liveness as:
 
 | State | Meaning |
 | --- | --- |
@@ -125,7 +123,7 @@ Use `gs log dev1` to print `worker.log`. Use `gs log dev1 --hub` to print `hub4c
 
 `stale` is not fatal. `gs stop dev1` should still clean that session's saved resources and should not fail merely because a saved process is gone. `gs rm dev1` performs the same live cleanup, then removes the session directory.
 
-When `worker_state` and `hub_state` are both `stopped`, nothing is appending serial output in the background. Reading the cache is still valid for old logs, but it is not a live device read. If the task needs fresh device output, reopen the session first, for example `gs open dev1 COM3 -b 115200`, before checking the cache again.
+When `worker_state` is `stopped`, nothing is appending serial output in the background. Reading the cache is still valid for old logs, but it is not a live device read. If the task needs fresh device output, reopen the session first, for example `gs open dev1 COM3 -b 115200`, before checking the cache again.
 
 ## Long-Running Modes
 
@@ -135,7 +133,7 @@ Use `gs tee dev1 serial.log` when the main goal is recording device output. It w
 
 Use `gs tcp dev1 :7001` when another process should connect over TCP. If the listen argument has no port, the CLI may normalize it to the default TCP listen port. `gs status dev1` shows the saved TCP address and worker log path.
 
-Use `gs share dev1 COM20 COM21` only when com0com/hub4com virtual-port sharing is needed. `gs stop dev1` must remove only that session's virtual port pairs.
+Use `gs share dev1 COM20 COM21` only when com0com virtual-port sharing is needed. `gs stop dev1` must remove only that session's virtual port pairs.
 
 Use `gs pause dev1` before burn or flash workflows that need exclusive access. `gs send`, `gs shell`, and other active serial commands should reject paused sessions until `gs resume dev1`.
 
@@ -145,7 +143,7 @@ Core serial behavior must go through `go.bug.st/serial` via `gs`; do not use Pow
 
 For `gs share`, require com0com to be installed explicitly and `setupc.exe` to be discoverable on `PATH` or in a standard Program Files location. Do not silently install drivers. If com0com is missing, fail with an actionable setup message.
 
-`gs` does not bundle com0com installers or hub4com binaries. The normal share worker uses the Go bridge built into `gs`; if the legacy hub4com fallback is used, require the user to install hub4com separately and make `hub4com.exe` discoverable on `PATH`.
+`gs` does not bundle com0com installers. The share worker uses the Go bridge built into `gs`.
 
 ## Skill Installation
 
@@ -171,7 +169,7 @@ Do not add remote registries, version solving, GitHub installs, package dependen
 | No output from `read` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` first. If stale, run `gs stop <session>` and reopen it. |
 | Missed output with `check` | Use `gs check <session> --rewind <bytes>` or `--from <offset>`. |
 | Worker startup failed | Read `worker.log`; `gs status` may surface `worker_error`. |
-| hub4com/share problem | Read `hub4com.log`; confirm com0com `setupc.exe` is installed and discoverable. |
+| Share problem | Read `worker.log`; confirm com0com `setupc.exe` is installed and discoverable. |
 | Stale PID | Run `gs stop <session>`; cleanup should handle missing processes. |
 
 ## Repository Guidance

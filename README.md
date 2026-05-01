@@ -52,9 +52,9 @@ tools still run on Windows. Linux and macOS already have good terminal tools for
 this kind of work. On Windows, serial work is often split across GUI tools,
 vendor utilities, virtual COM drivers, and small scripts.
 
-`gs` starts there. Serial enumeration, console input, process cleanup,
-com0com/hub4com sharing, logs, and manual intervention need to work well on a
-real Windows machine before the project spends much time on other platforms.
+`gs` starts there. Serial enumeration, console input, process cleanup, com0com
+sharing, logs, and manual intervention need to work well on a real Windows
+machine before the project spends much time on other platforms.
 
 ## Who uses it
 
@@ -66,7 +66,7 @@ Use `gs` when you need to:
 - keep a foreground serial shell or tee running when a human needs to step in.
 - cache serial output so humans, scripts, and agents can inspect it later.
 - expose a serial device over TCP for remote control or observation.
-- share a physical port through com0com/hub4com virtual COM ports.
+- share a physical port through com0com virtual COM ports.
 - install an agent skill that teaches Codex or Claude how to use this CLI.
 
 The primary platform is Windows. Linux support should remain possible, but
@@ -116,13 +116,13 @@ Then different tools can attach in different ways:
 - the upper-computer app connects to a virtual COM port created by
   `gs share dev1 COM20 COM21`.
 - a remote coworker or machine connects through `gs tcp dev1 :7001`.
-- everyone can inspect `cache.log`, `worker.log`, and `hub4com.log`.
+- everyone can inspect `cache.log` and `worker.log`.
 
 ```mermaid
 flowchart LR
     device["Industrial device\nphysical serial port COM3"]
     gs["gs session dev1\nopen/read/check/send\ncache + logs"]
-    cache["session files\nstate.json\ncache.log\nworker.log\nhub4com.log"]
+    cache["session files\nstate.json\ncache.log\nworker.log"]
 
     agent["AI agent\nserial-cli skill\ncheck/read/send/status/log"]
     human["Human operator\ngs shell dev1"]
@@ -263,20 +263,18 @@ Runtime dependencies depend on what you use:
   `shell`, `tee`, `tcp`, `status`, and `log` need only `gs.exe`.
 - `gs share` needs com0com installed on Windows, with `setupc.exe` available on
   `PATH` or in a standard Program Files install location.
-- The default `gs share` worker uses the Go bridge built into `gs`. The legacy
-  hub4com fallback, when used, expects an external `hub4com.exe` on `PATH`.
+- The `gs share` worker uses the Go bridge built into `gs` after com0com
+  creates the virtual COM pairs.
 
-Download com0com and hub4com from:
+Download com0com from:
 
 ```text
 com0com project site: https://com0com.com/
 com0com SourceForge project: https://sourceforge.net/projects/com0com/
-hub4com SourceForge files: https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 Install the driver manually. `gs` should not silently install kernel drivers.
-This repository does not vendor or redistribute com0com installers or hub4com
-binaries.
+This repository does not vendor or redistribute com0com installers.
 
 ## Command model
 
@@ -368,9 +366,10 @@ terminal, the requested file, and the session cache.
 `gs tcp` starts a background worker that accepts TCP clients and bridges them to
 the named serial session.
 
-`gs share` uses com0com plus hub4com to create and supervise virtual COM sharing.
-Driver installation remains explicit; `gs` should fail with an actionable error
-if com0com's `setupc.exe` is not available.
+`gs share` uses com0com plus the built-in Go byte bridge to share the named
+physical serial session through virtual COM ports. Driver installation remains
+explicit; `gs` should fail with an actionable error if com0com's `setupc.exe`
+is not available.
 
 ### Lifecycle and diagnostics
 
@@ -379,7 +378,6 @@ gs pause dev1
 gs resume dev1
 gs status dev1
 gs log dev1
-gs log dev1 --hub
 gs stop dev1
 gs rm dev1
 ```
@@ -441,9 +439,9 @@ a daemon that may or may not be running.
 
 ### Keep driver installation explicit
 
-Creating virtual COM pairs requires system-level drivers. `gs share` may use
-com0com and hub4com when available, but it should not silently install drivers.
-Missing prerequisites should produce clear setup guidance.
+Creating virtual COM pairs requires system-level drivers. `gs share` uses
+com0com for those pairs, but it should not silently install drivers. Missing
+prerequisites should produce clear setup guidance.
 
 ### Prove the CLI before adding a daemon
 
@@ -461,12 +459,11 @@ daemon to install or manage.
 flowchart TB
     user["Human / agent / script"]
     cli["gs.exe CLI\nversion ports open send read check shell tee tcp share status log stop rm"]
-    store["Session directory\n%AppData%/gs/sessions/dev1\nstate.json cache.log worker.log hub4com.log"]
+    store["Session directory\n%AppData%/gs/sessions/dev1\nstate.json cache.log worker.log"]
     worker["gs worker\nsame binary\nsession / tcp / share"]
     serial["go.bug.st/serial\nCOM3"]
     device["Device under test"]
     tcp["TCP clients\n:7001"]
-    hub["hub4com.exe"]
     com0com["com0com virtual ports\nCOM20 / COM21"]
     app["Upper-computer app"]
 
@@ -478,8 +475,7 @@ flowchart TB
     worker <--> store
     worker <--> serial
     worker <--> tcp
-    worker --> hub
-    hub <--> com0com
+    worker <--> com0com
     com0com <--> app
 ```
 
@@ -499,7 +495,7 @@ The live modes keep something open:
 - `gs tcp` records a TCP address and starts a worker that bridges TCP clients to
   the serial port.
 - `gs share` creates virtual COM pairs with com0com and starts a worker that
-  supervises hub4com.
+  runs the built-in Go byte bridge.
 
 The cache is the shared observation point. Workers and foreground readers append
 serial output to `cache.log`; humans and agents can read the same bytes later.
@@ -568,16 +564,15 @@ Important files:
 state.json
 cache.log
 worker.log
-hub4com.log
 ```
 
-Use `gs log <session>` for `worker.log`. Use `gs log <session> --hub` for
-`hub4com.log` when diagnosing `gs share`.
+Use `gs log <session>` for `worker.log` when diagnosing sessions and share
+workers.
 
-When `worker_state` and `hub_state` are both `stopped`, nothing is appending
-fresh serial output in the background. `read` and `check` can still inspect old
-cached bytes, but they are not live device reads. Run `gs open <session> <port>
--b <baud>` to restart the session worker.
+When `worker_state` is `stopped`, nothing is appending fresh serial output in
+the background. `read` and `check` can still inspect old cached bytes, but they
+are not live device reads. Run `gs open <session> <port> -b <baud>` to restart
+the session worker.
 
 ## Windows setup
 
@@ -586,16 +581,14 @@ Install com0com manually before using `gs share`:
 ```text
 com0com project site: https://com0com.com/
 com0com SourceForge project: https://sourceforge.net/projects/com0com/
-hub4com SourceForge files: https://sourceforge.net/projects/com0com/files/hub4com/
 ```
 
 After installing com0com, make sure `setupc.exe` is on `PATH`, or installed in a
 standard com0com location under `Program Files`.
 
-The normal `gs share` path uses the Go bridge built into `gs`, after com0com has
-created the virtual COM pairs. If you intentionally use the legacy hub4com
-fallback, install hub4com separately and make sure `hub4com.exe` is on `PATH`.
-`gs` does not bundle or extract third-party executables.
+The `gs share` path uses the Go bridge built into `gs`, after com0com has
+created the virtual COM pairs. `gs` does not bundle or extract third-party
+executables.
 
 ## Skill installation
 
@@ -688,7 +681,7 @@ dist/
 | No output from `read` or `check` | Run `gs status <session>`; if stopped, run `gs open <session> <port> -b <baud>` to restart the session worker. If stale, run `gs stop <session>` and reopen it. |
 | Missed output with `check` | Use `gs check <session> --rewind <bytes>` or `--from <offset>`. |
 | Worker startup failed | Read `worker.log`; `gs status` may surface `worker_error`. |
-| hub4com/share problem | Read `hub4com.log`; confirm com0com `setupc.exe` is installed and discoverable. |
+| Share problem | Read `worker.log`; confirm com0com `setupc.exe` is installed and discoverable. |
 | Stale PID | Run `gs stop <session>`; cleanup should handle missing processes. |
 
 ## Acknowledgements and licenses
@@ -697,10 +690,9 @@ The `gs` source code is released under the MIT License. See `LICENSE`.
 
 `gs` is designed with respect for the projects it can integrate with. Thanks to
 the com0com project for making practical virtual COM-port workflows available on
-Windows, and to the hub4com project for the serial routing model that inspired
-`gs share` and remains useful as an external fallback.
+Windows.
 
 To keep licensing boundaries clear, this repository does not contain com0com or
-hub4com binaries, installers, batch files, or documentation copies. Users who
-choose to use those tools should download them from their upstream project and
-follow their licenses.
+other third-party driver binaries, installers, batch files, or documentation
+copies. Users who choose to use those tools should download them from their
+upstream project and follow their licenses.

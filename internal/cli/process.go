@@ -12,26 +12,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"go-serial-cli/internal/diag"
 )
-
-type ManagedProcess struct {
-	PID  int
-	Wait func() error
-}
-
-type HubOptions struct {
-	SessionName  string
-	PhysicalPort string
-	Baud         int
-	HubPorts     []string
-	LogPath      string
-}
 
 func startWorkerProcess(sessionName string) (int, error) {
 	exe, err := os.Executable()
@@ -109,80 +95,6 @@ func isProcessRunning(pid int) bool {
 	err = process.Signal(syscall.Signal(0))
 	_ = process.Release()
 	return err == nil
-}
-
-func startHubProcess(opts HubOptions) (ManagedProcess, error) {
-	if opts.PhysicalPort == "" {
-		return ManagedProcess{}, errors.New("physical port is required")
-	}
-	if len(opts.HubPorts) == 0 {
-		return ManagedProcess{}, errors.New("hub ports are required")
-	}
-	exe, err := findHub4com()
-	if err != nil {
-		return ManagedProcess{}, err
-	}
-	args := hubCommandArgs(opts)
-	cmd := newHub4comCommand(exe, args)
-	configureBackgroundProcess(cmd)
-	var logFile *os.File
-	if opts.LogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(opts.LogPath), 0o755); err != nil {
-			return ManagedProcess{}, err
-		}
-		var openErr error
-		logFile, openErr = os.OpenFile(opts.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if openErr != nil {
-			return ManagedProcess{}, openErr
-		}
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-	}
-	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return ManagedProcess{}, diag.Hub4comStartError(err)
-	}
-	return ManagedProcess{
-		PID: cmd.Process.Pid,
-		Wait: func() error {
-			err := cmd.Wait()
-			if logFile != nil {
-				closeErr := logFile.Close()
-				if err == nil {
-					err = closeErr
-				}
-			}
-			return err
-		},
-	}, nil
-}
-
-func findHub4com() (string, error) {
-	path, err := exec.LookPath("hub4com.exe")
-	if err == nil {
-		return path, nil
-	}
-	return "", diag.MissingHub4comError()
-}
-
-func newHub4comCommand(hub4com string, args []string) *exec.Cmd {
-	cmd := exec.Command(hub4com, args...)
-	cmd.Dir = filepath.Dir(hub4com)
-	return cmd
-}
-
-func hubCommandArgs(opts HubOptions) []string {
-	args := []string{"--route=All:All"}
-	if opts.Baud > 0 {
-		args = append(args, "--baud="+strconv.Itoa(opts.Baud))
-	}
-	args = append(args, "--octs=off", windowsCOMPath(opts.PhysicalPort))
-	for _, port := range opts.HubPorts {
-		args = append(args, windowsCOMPath(port))
-	}
-	return args
 }
 
 func createVirtualPorts(pairs []VirtualPortPair) error {

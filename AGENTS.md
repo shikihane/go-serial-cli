@@ -30,7 +30,6 @@ gs pause dev1
 gs resume dev1
 gs status dev1
 gs log dev1
-gs log dev1 --hub
 gs stop dev1
 gs rm dev1
 gs list
@@ -94,21 +93,21 @@ Use `go.bug.st/serial` for serial behavior. Do not shell out to PowerShell for c
 
 `gs tee <session> <file>` opens the named session port and keeps it open in the foreground. It continuously writes serial output to both the screen and the file, and also appends output to the local cache file used by `gs read <session>`.
 
-`gs share <session> <virtual-port>...` creates the com0com virtual port pairs when `setupc.exe` is available, records the virtual ports, and starts a background `gs worker` that launches and supervises hub4com for that session. Driver installation must remain explicit; if com0com is not installed or `setupc.exe` is not on PATH, the command should fail with an actionable error rather than silently installing a driver.
+`gs share <session> <virtual-port>...` creates the com0com virtual port pairs when `setupc.exe` is available, records the public virtual ports and private hub ports, and starts a background `gs worker` that runs the built-in Go byte bridge for that session. The bridge treats virtual COM ports as byte-stream clients. Virtual-port baud, line settings, and modem-control signals are not propagated to the physical serial port; the physical serial port is configured only by the named session state. Driver installation must remain explicit; if com0com is not installed or `setupc.exe` is not on PATH, the command should fail with an actionable error rather than silently installing a driver.
 
 `gs tcp <session> <listen-address>` records a TCP listen address and starts a background `gs worker` that accepts TCP clients and bridges them to the named serial session.
 
-Background workers append lifecycle and retry diagnostics to each session's `worker.log`. hub4com stdout/stderr is written to `hub4com.log`. These files live next to `state.json` and `cache.log` under the session directory.
+Background workers append lifecycle and retry diagnostics to each session's `worker.log`. This file lives next to `state.json` and `cache.log` under the session directory.
 
-`gs log <session>` prints that session's `worker.log`. Use `gs log <session> --hub` to print `hub4com.log` when diagnosing share/hub4com behavior.
+`gs log <session>` prints that session's `worker.log`. Use it when diagnosing share behavior.
 
 `gs status <session>` should expose PID liveness as `running`, `stale`, or `stopped`. `stale` means the PID is saved in state but no matching process is running; `gs stop <session>` should still clean only that session's resources without failing on the missing process.
 
 `gs pause <session>` and `gs resume <session>` update local session state. They are preparation for burn/flash workflows and future long-running session ownership.
 
-`gs stop <session>` stops only the named session's worker/hub processes, removes only that session's virtual port pairs, and clears live resource state. It must not stop other sessions because multiple agents may be controlling different devices.
+`gs stop <session>` stops only the named session's worker process, removes only that session's virtual port pairs, and clears live resource state. It must not stop other sessions because multiple agents may be controlling different devices.
 
-`gs rm <session>` performs the same named-session live cleanup as `gs stop <session>`, then deletes that session directory including `state.json`, `cache.log`, `worker.log`, `hub4com.log`, and extracted tools. It must not remove other sessions.
+`gs rm <session>` performs the same named-session live cleanup as `gs stop <session>`, then deletes that session directory including `state.json`, `cache.log`, `worker.log`, and extracted tools. It must not remove other sessions.
 
 ## Development Rules
 

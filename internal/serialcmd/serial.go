@@ -400,19 +400,25 @@ func ShareBridge(opts ShareBridgeOptions) error {
 	}
 	defer closeOutput()
 
+	physical, err := openPort(opts.PhysicalPort, opts.Baud)
+	if err != nil {
+		return diag.SerialOpenError(opts.PhysicalPort, err)
+	}
+
 	endpoints := make([]shareEndpoint, 0, len(opts.HubPorts))
-	defer closeShareEndpoints(endpoints)
 	for _, hubPort := range opts.HubPorts {
 		opened, err := openPort(hubPort, opts.Baud)
 		if err != nil {
+			_ = physical.Close()
+			closeShareEndpoints(endpoints)
 			return diag.SerialOpenError(hubPort, err)
 		}
 		endpoints = append(endpoints, shareEndpoint{name: hubPort, port: opened, writes: make(chan []byte, 256)})
 	}
 
-	bridge := newShareBridge(opts.PhysicalPort, opts.Baud, openPort, endpoints, output)
+	bridge := newShareBridge(opts.PhysicalPort, physical, endpoints, output)
 	bridge.startHubWriters()
-	defer bridge.closeClients()
+	defer bridge.close()
 
 	var listeners []net.Listener
 	if opts.ControlAddress != "" {
@@ -432,7 +438,10 @@ func ShareBridge(opts ShareBridgeOptions) error {
 		defer listener.Close()
 	}
 
-	errCh := make(chan error, len(endpoints)+len(listeners)+1)
+	errCh := make(chan error, len(endpoints)+len(listeners)+2)
+	go func() {
+		errCh <- bridge.copyPhysicalToOutputs()
+	}()
 	for i := range endpoints {
 		endpoint := endpoints[i]
 		go func() {
@@ -523,15 +532,15 @@ type shareEndpoint struct {
 }
 
 type shareBridge struct {
-	physicalPort string
-	baud         int
-	openPort     func(port string, baud int) (SerialPort, error)
+	physicalName string
+	physical     SerialPort
 	endpoints    []shareEndpoint
 	output       io.Writer
 	mu           sync.Mutex
 	writeMu      sync.Mutex
 	clients      map[net.Conn]struct{}
 	asyncWG      sync.WaitGroup
+	closeOnce    sync.Once
 }
 
 func newSessionServer(port SerialPort, output io.Writer) *sessionServer {
@@ -542,11 +551,10 @@ func newSessionServer(port SerialPort, output io.Writer) *sessionServer {
 	}
 }
 
-func newShareBridge(physicalPort string, baud int, openPort func(port string, baud int) (SerialPort, error), endpoints []shareEndpoint, output io.Writer) *shareBridge {
+func newShareBridge(physicalName string, physical SerialPort, endpoints []shareEndpoint, output io.Writer) *shareBridge {
 	return &shareBridge{
-		physicalPort: physicalPort,
-		baud:         baud,
-		openPort:     openPort,
+		physicalName: physicalName,
+		physical:     physical,
 		endpoints:    endpoints,
 		output:       output,
 		clients:      map[net.Conn]struct{}{},
@@ -560,12 +568,15 @@ func closeShareEndpoints(endpoints []shareEndpoint) {
 }
 
 func (b *shareBridge) close() {
-	for _, endpoint := range b.endpoints {
-		close(endpoint.writes)
-	}
-	closeShareEndpoints(b.endpoints)
-	b.closeClients()
-	b.asyncWG.Wait()
+	b.closeOnce.Do(func() {
+		_ = b.physical.Close()
+		for _, endpoint := range b.endpoints {
+			close(endpoint.writes)
+		}
+		closeShareEndpoints(b.endpoints)
+		b.closeClients()
+		b.asyncWG.Wait()
+	})
 }
 
 func (b *shareBridge) startHubWriters() {
@@ -627,7 +638,7 @@ func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
 		n, err := conn.Read(buf)
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
-			if writeErr := b.writePhysicalTransaction(data); writeErr != nil {
+			if writeErr := b.writePhysical(data); writeErr != nil {
 				return writeErr
 			}
 		}
@@ -657,27 +668,22 @@ func (b *shareBridge) copyEndpointToOthers(source shareEndpoint) error {
 }
 
 func (b *shareBridge) routeEndpointData(source shareEndpoint, data []byte) error {
-	return b.writePhysicalTransaction(data)
+	return b.writePhysical(data)
 }
 
-func (b *shareBridge) writePhysicalTransaction(data []byte) error {
+func (b *shareBridge) writePhysical(data []byte) error {
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
-	port, err := b.openPort(b.physicalPort, b.baud)
-	if err != nil {
-		return diag.SerialOpenError(b.physicalPort, err)
+	if _, err := b.physical.Write(data); err != nil {
+		return fmt.Errorf("write serial port %s: %w", b.physicalName, err)
 	}
-	defer port.Close()
-	if _, err := port.Write(data); err != nil {
-		return fmt.Errorf("write serial port %s: %w", b.physicalPort, err)
-	}
-	return b.readPhysicalTransactionResponse(port)
+	return nil
 }
 
-func (b *shareBridge) readPhysicalTransactionResponse(port SerialPort) error {
+func (b *shareBridge) copyPhysicalToOutputs() error {
 	buf := make([]byte, 4096)
 	for {
-		n, err := readSerialWithIdleTimeout(port, buf, 150*time.Millisecond)
+		n, err := b.physical.Read(buf)
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			if _, writeErr := b.output.Write(data); writeErr != nil {
@@ -685,39 +691,13 @@ func (b *shareBridge) readPhysicalTransactionResponse(port SerialPort) error {
 			}
 			b.writeToHubEndpointsAsync(data)
 			b.broadcast(data)
-			continue
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return fmt.Errorf("read serial port %s: closed", b.physicalName)
 			}
-			return fmt.Errorf("read serial port %s: %w", b.physicalPort, err)
+			return fmt.Errorf("read serial port %s: %w", b.physicalName, err)
 		}
-		return nil
-	}
-}
-
-func readSerialWithIdleTimeout(port SerialPort, buf []byte, idle time.Duration) (int, error) {
-	if timeoutPort, ok := port.(interface{ SetReadTimeout(time.Duration) error }); ok {
-		if err := timeoutPort.SetReadTimeout(idle); err != nil {
-			return 0, err
-		}
-		return port.Read(buf)
-	}
-	type readResult struct {
-		n   int
-		err error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		n, err := port.Read(buf)
-		ch <- readResult{n: n, err: err}
-	}()
-	select {
-	case result := <-ch:
-		return result.n, result.err
-	case <-time.After(idle):
-		return 0, nil
 	}
 }
 

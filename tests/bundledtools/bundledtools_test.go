@@ -14,7 +14,7 @@ func TestListDoesNotIncludeThirdPartyBinaries(t *testing.T) {
 	}
 
 	for _, file := range files {
-		if strings.HasPrefix(file, "com0com/") || strings.HasPrefix(file, "hub4com/") {
+		if strings.HasPrefix(file, "com0com/") {
 			t.Fatalf("List includes third-party binary asset %q", file)
 		}
 	}

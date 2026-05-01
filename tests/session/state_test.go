@@ -168,14 +168,11 @@ func TestStoreUsesPerSessionCachePaths(t *testing.T) {
 	}
 }
 
-func TestStoreUsesPerSessionWorkerAndHubLogPaths(t *testing.T) {
+func TestStoreUsesPerSessionWorkerLogPath(t *testing.T) {
 	store := session.Store{Dir: t.TempDir()}
 
 	if got := store.WorkerLogPath("dev1"); filepath.Base(got) != "worker.log" {
 		t.Fatalf("WorkerLogPath base = %q, want worker.log", filepath.Base(got))
-	}
-	if got := store.HubLogPath("dev1"); filepath.Base(got) != "hub4com.log" {
-		t.Fatalf("HubLogPath base = %q, want hub4com.log", filepath.Base(got))
 	}
 	if filepath.Dir(store.WorkerLogPath("dev1")) != store.SessionDir("dev1") {
 		t.Fatalf("WorkerLogPath dir = %q, want %q", filepath.Dir(store.WorkerLogPath("dev1")), store.SessionDir("dev1"))

@@ -38,7 +38,6 @@ type AppDeps struct {
 	WaitForControl        func(address string) error
 	CreateVirtualPorts    func(pairs []VirtualPortPair) error
 	RemoveVirtualPorts    func(pairs []VirtualPortPair) error
-	StartHub              func(opts HubOptions) (ManagedProcess, error)
 	RunSetupC             func(args []string, output io.Writer) error
 	AdminPause            func()
 	BridgeTCP             func(opts serialcmd.TCPBridgeOptions) error
@@ -168,7 +167,6 @@ func DefaultDeps() (AppDeps, error) {
 		WaitForControl:        waitForControlAddress,
 		CreateVirtualPorts:    createVirtualPorts,
 		RemoveVirtualPorts:    removeVirtualPorts,
-		StartHub:              startHubProcess,
 		RunSetupC:             runSetupCDirect,
 		AdminPause:            pauseAdminWindow,
 		BridgeTCP:             serialcmd.BridgeTCP,
@@ -247,7 +245,7 @@ func (a *App) runTools(args []string, out io.Writer) error {
 	if len(args) != 2 || args[0] != "extract" {
 		return errors.New("usage: gs tools extract <dir>")
 	}
-	return errors.New("no third-party tools are bundled; install com0com and hub4com externally and make setupc.exe and hub4com.exe discoverable on PATH")
+	return errors.New("no third-party tools are bundled; install com0com externally and make setupc.exe discoverable on PATH")
 }
 
 func (a *App) runPorts(out io.Writer) error {
@@ -1290,49 +1288,26 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 		return err
 	}
 	if len(state.HubPorts) > 0 {
-		if a.deps.RunShareBridge != nil {
-			controlAddress := state.ControlAddress
-			if controlAddress == "" {
-				controlAddress = state.TCPAddress
-			}
-			return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
-				return a.deps.RunShareBridge(serialcmd.ShareBridgeOptions{
-					PhysicalPort:   state.Port,
-					HubPorts:       append([]string(nil), state.HubPorts...),
-					Baud:           state.Baud,
-					CachePath:      a.deps.Store.CachePath(name),
-					ControlAddress: controlAddress,
-					TCPAddress:     state.TCPAddress,
-				})
-			})
+		if a.deps.RunShareBridge == nil {
+			return errors.New("share bridge is unavailable")
 		}
-		if a.deps.StartHub == nil {
-			return errors.New("hub4com process starter is unavailable")
+		controlAddress := state.ControlAddress
+		if controlAddress == "" {
+			controlAddress = state.TCPAddress
+		}
+		state.HubPID = 0
+		if err := a.deps.Store.Save(state); err != nil {
+			return err
 		}
 		return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
-			proc, err := a.deps.StartHub(HubOptions{
-				SessionName:  state.Name,
-				PhysicalPort: state.Port,
-				Baud:         state.Baud,
-				HubPorts:     append([]string(nil), state.HubPorts...),
-				LogPath:      a.deps.Store.HubLogPath(name),
+			return a.deps.RunShareBridge(serialcmd.ShareBridgeOptions{
+				PhysicalPort:   state.Port,
+				HubPorts:       append([]string(nil), state.HubPorts...),
+				Baud:           state.Baud,
+				CachePath:      a.deps.Store.CachePath(name),
+				ControlAddress: controlAddress,
+				TCPAddress:     state.TCPAddress,
 			})
-			if err != nil {
-				return err
-			}
-			appendWorkerLog(fmt.Sprintf("hub start pid=%d ports=%s", proc.PID, strings.Join(state.HubPorts, ",")))
-			current, err := a.deps.Store.Load(name)
-			if err != nil {
-				return err
-			}
-			current.HubPID = proc.PID
-			if err := a.deps.Store.Save(current); err != nil {
-				return err
-			}
-			if proc.Wait != nil {
-				return proc.Wait()
-			}
-			return nil
 		})
 	}
 	if a.deps.StreamSerial == nil {
@@ -1631,7 +1606,7 @@ func (a *App) runStatus(args []string, out io.Writer) error {
 
 func (a *App) runLog(args []string, out io.Writer) error {
 	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: gs log <session> [--worker|--hub]")
+		return errors.New("usage: gs log <session> [--worker]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1642,10 +1617,8 @@ func (a *App) runLog(args []string, out io.Writer) error {
 		switch args[1] {
 		case "--worker":
 			logKind = "worker"
-		case "--hub":
-			logKind = "hub"
 		default:
-			return errors.New("usage: gs log <session> [--worker|--hub]")
+			return errors.New("usage: gs log <session> [--worker]")
 		}
 	}
 	if a.deps.Store.Dir == "" {
@@ -1656,9 +1629,6 @@ func (a *App) runLog(args []string, out io.Writer) error {
 		return err
 	}
 	logPath := a.deps.Store.WorkerLogPath(name)
-	if logKind == "hub" {
-		logPath = a.deps.Store.HubLogPath(name)
-	}
 	f, err := os.Open(logPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1797,7 +1767,7 @@ Usage:
   gs pause <session>
   gs resume <session>
   gs status <session>
-  gs log <session> [--worker|--hub]
+  gs log <session> [--worker]
   gs stop <session>
   gs rm <session>
   gs list
@@ -1831,21 +1801,11 @@ func printState(out io.Writer, state session.State, store session.Store, isRunni
 			_, _ = fmt.Fprintf(out, "worker_error: %s\n", err)
 		}
 	}
-	showHub := state.HubPID != 0 || len(state.VirtualPorts) > 0 || state.Status == session.StatusSharing
-	if showHub {
-		if state.HubPID != 0 {
-			_, _ = fmt.Fprintf(out, "hub_pid: %d\n", state.HubPID)
-		}
-		_, _ = fmt.Fprintf(out, "hub_state: %s\n", processState(state.HubPID, isRunning))
-	}
 	if state.TCPAddress != "" {
 		_, _ = fmt.Fprintf(out, "tcp: %s\n", state.TCPAddress)
 	}
 	if store.Dir != "" {
 		_, _ = fmt.Fprintf(out, "worker_log: %s\n", store.WorkerLogPath(state.Name))
-		if showHub {
-			_, _ = fmt.Fprintf(out, "hub_log: %s\n", store.HubLogPath(state.Name))
-		}
 	}
 }
 

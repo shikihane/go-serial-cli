@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,12 +19,13 @@ import (
 const shareEndpointWriteTimeout = 250 * time.Millisecond
 
 type StreamOptions struct {
-	Port      string
-	Baud      int
-	Input     io.Reader
-	Output    io.Writer
-	TeePath   string
-	CachePath string
+	Port           string
+	Baud           int
+	Input          io.Reader
+	Output         io.Writer
+	TeePath        string
+	CachePath      string
+	CacheIndexPath string
 }
 
 type SerialPort interface {
@@ -33,25 +33,30 @@ type SerialPort interface {
 }
 
 type AskOptions struct {
-	Port      string
-	Baud      int
-	Data      string
-	Timeout   time.Duration
-	MaxLines  int
-	Output    io.Writer
-	CachePath string
-	OpenPort  func(port string, baud int) (SerialPort, error)
+	Port           string
+	Baud           int
+	Data           string
+	Payload        []byte
+	Timeout        time.Duration
+	MaxLines       int
+	Output         io.Writer
+	OutputHex      bool
+	ShowTimestamps bool
+	CachePath      string
+	CacheIndexPath string
+	OpenPort       func(port string, baud int) (SerialPort, error)
 }
 
 type TCPBridgeOptions struct {
-	ListenAddress string
-	Port          string
-	Baud          int
-	CachePath     string
-	AcceptOne     bool
-	Stop          <-chan struct{}
-	OpenPort      func(port string, baud int) (SerialPort, error)
-	OnListening   func(address string)
+	ListenAddress  string
+	Port           string
+	Baud           int
+	CachePath      string
+	CacheIndexPath string
+	AcceptOne      bool
+	Stop           <-chan struct{}
+	OpenPort       func(port string, baud int) (SerialPort, error)
+	OnListening    func(address string)
 }
 
 type SessionServerOptions struct {
@@ -59,6 +64,7 @@ type SessionServerOptions struct {
 	Port           string
 	Baud           int
 	CachePath      string
+	CacheIndexPath string
 	Stop           <-chan struct{}
 	OpenPort       func(port string, baud int) (SerialPort, error)
 }
@@ -68,6 +74,7 @@ type ShareBridgeOptions struct {
 	HubPorts       []string
 	Baud           int
 	CachePath      string
+	CacheIndexPath string
 	ControlAddress string
 	TCPAddress     string
 	Stop           <-chan struct{}
@@ -85,6 +92,14 @@ func Ports() ([]string, error) {
 }
 
 func Send(port string, baud int, data string) error {
+	payload, err := ParseTextPayload(data)
+	if err != nil {
+		return err
+	}
+	return SendPayload(port, baud, payload)
+}
+
+func SendPayload(port string, baud int, payload []byte) error {
 	if port == "" {
 		return errors.New("port is required")
 	}
@@ -98,10 +113,6 @@ func Send(port string, baud int, data string) error {
 	}
 	defer p.Close()
 
-	payload, err := parsePayload(data)
-	if err != nil {
-		return err
-	}
 	n, err := p.Write(payload)
 	if err != nil {
 		return fmt.Errorf("write serial port %s: %w", port, err)
@@ -139,23 +150,39 @@ func Ask(opts AskOptions) error {
 	}
 	defer p.Close()
 
-	output, closeOutput, err := streamOutput(StreamOptions{Output: opts.Output, CachePath: opts.CachePath})
-	if err != nil {
-		return err
-	}
-	defer closeOutput()
-
-	payload, err := parsePayload(opts.Data)
+	payload, err := payloadFromOptions(opts.Data, opts.Payload)
 	if err != nil {
 		return err
 	}
 	if err := writePayloadToPort(payload, p, opts.Port); err != nil {
 		return err
 	}
-	return readAskResponse(p, output, opts.Port, opts.Timeout, opts.MaxLines)
+
+	if opts.OutputHex {
+		cache, closeCache, err := askCacheWriter(opts.CachePath, opts.CacheIndexPath)
+		if err != nil {
+			return err
+		}
+		defer closeCache()
+		return readAskHexResponse(p, opts.Output, cache, opts.Port, opts.Timeout, opts.ShowTimestamps)
+	}
+
+	cache, closeCache, err := askCacheWriter(opts.CachePath, opts.CacheIndexPath)
+	if err != nil {
+		return err
+	}
+	defer closeCache()
+	return readAskResponse(p, opts.Output, cache, opts.Port, opts.Timeout, opts.MaxLines, opts.ShowTimestamps)
 }
 
-func readAskResponse(port SerialPort, output io.Writer, portName string, timeout time.Duration, maxLines int) error {
+func payloadFromOptions(data string, payload []byte) ([]byte, error) {
+	if payload != nil {
+		return payload, nil
+	}
+	return ParseTextPayload(data)
+}
+
+func readAskResponse(port SerialPort, output io.Writer, cache io.Writer, portName string, timeout time.Duration, maxLines int, showTimestamps bool) error {
 	type readResult struct {
 		data []byte
 		n    int
@@ -164,7 +191,7 @@ func readAskResponse(port SerialPort, output io.Writer, portName string, timeout
 	results := make(chan readResult, 1)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	response := make([]byte, 0, 4096)
+	var chunks []TimedChunk
 
 	for {
 		go func() {
@@ -177,16 +204,72 @@ func readAskResponse(port SerialPort, output io.Writer, portName string, timeout
 		case <-timer.C:
 			_ = port.Close()
 			<-results
-			_, err := output.Write(lastLines(response, maxLines))
-			return err
+			return writeAskTextResponse(output, cache, chunks, maxLines, showTimestamps)
 		case result := <-results:
 			if result.n > 0 {
-				response = append(response, result.data...)
+				chunks = append(chunks, TimedChunk{At: time.Now().Local(), Data: append([]byte(nil), result.data...)})
 			}
 			if result.err != nil {
 				if errors.Is(result.err, io.EOF) {
-					_, writeErr := output.Write(lastLines(response, maxLines))
-					return writeErr
+					return writeAskTextResponse(output, cache, chunks, maxLines, showTimestamps)
+				}
+				return fmt.Errorf("read serial port %s: %w", portName, result.err)
+			}
+		}
+	}
+}
+
+func writeAskTextResponse(output io.Writer, cache io.Writer, chunks []TimedChunk, maxLines int, showTimestamps bool) error {
+	chunks = LastLineChunks(chunks, maxLines)
+	if _, err := WriteTimedChunks(cache, chunks); err != nil {
+		return err
+	}
+	_, err := output.Write(FormatTextChunks(chunks, showTimestamps))
+	return err
+}
+
+func askCacheWriter(path string, indexPath string) (io.Writer, func(), error) {
+	if indexPath == "" {
+		indexPath = CacheIndexPath(path)
+	}
+	return OpenTimedCacheWriter(path, indexPath)
+}
+
+func readAskHexResponse(port SerialPort, output io.Writer, cache io.Writer, portName string, timeout time.Duration, showTimestamps bool) error {
+	type readResult struct {
+		data []byte
+		n    int
+		err  error
+	}
+	results := make(chan readResult, 1)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		go func() {
+			buf := make([]byte, 4096)
+			n, err := port.Read(buf)
+			results <- readResult{data: buf[:n], n: n, err: err}
+		}()
+
+		select {
+		case <-timer.C:
+			_ = port.Close()
+			<-results
+			return nil
+		case result := <-results:
+			if result.n > 0 {
+				chunk := TimedChunk{At: time.Now().Local(), Data: append([]byte(nil), result.data...)}
+				if _, err := WriteTimedChunks(cache, []TimedChunk{chunk}); err != nil {
+					return err
+				}
+				if _, err := output.Write(FormatHexChunks([]TimedChunk{chunk}, showTimestamps)); err != nil {
+					return err
+				}
+			}
+			if result.err != nil {
+				if errors.Is(result.err, io.EOF) {
+					return nil
 				}
 				return fmt.Errorf("read serial port %s: %w", portName, result.err)
 			}
@@ -268,7 +351,7 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 	}
 	defer port.Close()
 
-	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath})
+	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
 		return err
 	}
@@ -340,7 +423,7 @@ func RunSessionServer(opts SessionServerOptions) error {
 	}
 	defer port.Close()
 
-	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath})
+	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
 		return err
 	}
@@ -397,7 +480,7 @@ func ShareBridge(opts ShareBridgeOptions) error {
 		openPort = openSerialPort
 	}
 
-	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath})
+	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
 		return err
 	}
@@ -484,15 +567,19 @@ func ShareBridge(opts ShareBridgeOptions) error {
 }
 
 func SendToSession(address string, data string) error {
+	payload, err := ParseTextPayload(data)
+	if err != nil {
+		return err
+	}
+	return SendPayloadToSession(address, payload)
+}
+
+func SendPayloadToSession(address string, payload []byte) error {
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	payload, err := parsePayload(data)
-	if err != nil {
-		return err
-	}
 	n, err := conn.Write(payload)
 	if err != nil {
 		return err
@@ -851,7 +938,7 @@ func bridgeTCPConn(conn net.Conn, opts TCPBridgeOptions, openPort func(string, i
 	}
 	defer port.Close()
 
-	output, closeOutput, err := streamOutput(StreamOptions{Output: conn, CachePath: opts.CachePath})
+	output, closeOutput, err := streamOutput(StreamOptions{Output: conn, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
 		return err
 	}
@@ -890,7 +977,11 @@ func streamOutput(opts StreamOptions) (io.Writer, func(), error) {
 		closers = append(closers, f)
 	}
 	if opts.CachePath != "" {
-		f, err := openAppendFile(opts.CachePath)
+		indexPath := opts.CacheIndexPath
+		if indexPath == "" {
+			indexPath = CacheIndexPath(opts.CachePath)
+		}
+		f, closeCache, err := OpenTimedCacheWriter(opts.CachePath, indexPath)
 		if err != nil {
 			for _, closer := range closers {
 				_ = closer.Close()
@@ -898,7 +989,7 @@ func streamOutput(opts StreamOptions) (io.Writer, func(), error) {
 			return nil, func() {}, err
 		}
 		writers = append(writers, f)
-		closers = append(closers, f)
+		closers = append(closers, closerFunc(closeCache))
 	}
 	return io.MultiWriter(writers...), func() {
 		for _, closer := range closers {
@@ -976,17 +1067,6 @@ func isImmediateControlByte(ch byte) bool {
 	return ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t'
 }
 
-func inputLinePayload(line string) ([]byte, error) {
-	payload, err := parsePayload(line)
-	if err != nil {
-		return nil, err
-	}
-	if strings.Contains(line, `\r`) || strings.Contains(line, `\n`) || hasLineEnding(payload) {
-		return payload, nil
-	}
-	return append(payload, '\r', '\n'), nil
-}
-
 func copyPortToOutput(port io.Reader, output io.Writer, portName string) error {
 	buf := make([]byte, 4096)
 	for {
@@ -1002,88 +1082,5 @@ func copyPortToOutput(port io.Reader, output io.Writer, portName string) error {
 			}
 			return fmt.Errorf("read serial port %s: %w", portName, err)
 		}
-	}
-}
-
-func hasLineEnding(value []byte) bool {
-	if len(value) == 0 {
-		return false
-	}
-	last := value[len(value)-1]
-	return last == '\r' || last == '\n'
-}
-
-func unescape(value string) string {
-	payload, err := parsePayload(value)
-	if err != nil {
-		return value
-	}
-	return string(payload)
-}
-
-func parsePayload(value string) ([]byte, error) {
-	payload := make([]byte, 0, len(value))
-	for i := 0; i < len(value); i++ {
-		if value[i] != '\\' {
-			payload = append(payload, value[i])
-			continue
-		}
-		if i+1 >= len(value) {
-			payload = append(payload, value[i])
-			continue
-		}
-
-		i++
-		switch value[i] {
-		case 'r':
-			payload = append(payload, '\r')
-		case 'n':
-			payload = append(payload, '\n')
-		case 't':
-			payload = append(payload, '\t')
-		case 'x':
-			if i+2 >= len(value) {
-				return nil, fmt.Errorf("invalid hex escape at byte %d: want \\xNN", i-1)
-			}
-			hi, ok := hexValue(value[i+1])
-			if !ok {
-				return nil, fmt.Errorf("invalid hex escape at byte %d: want \\xNN", i-1)
-			}
-			lo, ok := hexValue(value[i+2])
-			if !ok {
-				return nil, fmt.Errorf("invalid hex escape at byte %d: want \\xNN", i-1)
-			}
-			payload = append(payload, hi<<4|lo)
-			i += 2
-		case 'c':
-			if i+1 >= len(value) {
-				return nil, fmt.Errorf("invalid control escape at byte %d: want \\cA through \\cZ", i-1)
-			}
-			ch := value[i+1]
-			if ch >= 'a' && ch <= 'z' {
-				ch -= 'a' - 'A'
-			}
-			if ch < 'A' || ch > 'Z' {
-				return nil, fmt.Errorf("invalid control escape at byte %d: want \\cA through \\cZ", i-1)
-			}
-			payload = append(payload, ch-'A'+1)
-			i++
-		default:
-			payload = append(payload, '\\', value[i])
-		}
-	}
-	return payload, nil
-}
-
-func hexValue(value byte) (byte, bool) {
-	switch {
-	case value >= '0' && value <= '9':
-		return value - '0', true
-	case value >= 'a' && value <= 'f':
-		return value - 'a' + 10, true
-	case value >= 'A' && value <= 'F':
-		return value - 'A' + 10, true
-	default:
-		return 0, false
 	}
 }

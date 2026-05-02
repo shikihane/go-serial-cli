@@ -48,8 +48,10 @@ type AppDeps struct {
 	Store                 session.Store
 	ListPorts             func() ([]string, error)
 	SendSerial            func(port string, baud int, data string) error
+	SendSerialPayload     func(port string, baud int, payload []byte) error
 	AskSerial             func(opts serialcmd.AskOptions) error
 	SendSession           func(address string, data string) error
+	SendSessionPayload    func(address string, payload []byte) error
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
 	IsProcessRunning      func(pid int) bool
@@ -198,8 +200,10 @@ func DefaultDeps() (AppDeps, error) {
 		Store:                 store,
 		ListPorts:             serialcmd.Ports,
 		SendSerial:            serialcmd.Send,
+		SendSerialPayload:     serialcmd.SendPayload,
 		AskSerial:             serialcmd.Ask,
 		SendSession:           serialcmd.SendToSession,
+		SendSessionPayload:    serialcmd.SendPayloadToSession,
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
 		IsProcessRunning:      isProcessRunning,
@@ -447,11 +451,15 @@ func (a *App) startSessionWorker(name string) error {
 }
 
 func (a *App) runSend(args []string, out io.Writer) error {
-	if len(args) != 2 {
-		return a.usage("send <session> <data>")
+	if len(args) < 2 {
+		return a.usage("send <session> [-x] <data...>")
 	}
 	name := args[0]
-	if a.deps.Store.Dir != "" && (a.deps.SendSerial != nil || a.deps.SendSession != nil) {
+	payload, err := parseSendPayload(args[1:])
+	if err != nil {
+		return err
+	}
+	if a.deps.Store.Dir != "" && (a.deps.SendSerial != nil || a.deps.SendSerialPayload != nil || a.deps.SendSession != nil || a.deps.SendSessionPayload != nil) {
 		state, err := a.deps.Store.Load(name)
 		if err != nil {
 			return err
@@ -461,47 +469,89 @@ func (a *App) runSend(args []string, out io.Writer) error {
 		}
 		if address, ok, err := sessionDialAddress(state); err != nil {
 			return err
-		} else if ok && a.deps.SendSession != nil {
-			if err := a.deps.SendSession(address, args[1]); err != nil {
+		} else if ok && (a.deps.SendSessionPayload != nil || a.deps.SendSession != nil) {
+			if err := a.sendSessionPayload(address, payload); err != nil {
 				return err
 			}
 		} else if state.Status == session.StatusSharing {
 			return a.sharedControlUnavailable()
-		} else if a.deps.SendSerial != nil {
-			if err := a.deps.SendSerial(state.Port, state.Baud, args[1]); err != nil {
+		} else if a.deps.SendSerialPayload != nil || a.deps.SendSerial != nil {
+			if err := a.sendSerialPayload(state.Port, state.Baud, payload); err != nil {
 				return err
 			}
 		} else {
 			return errors.New("serial sender is unavailable")
 		}
 	}
-	_, _ = fmt.Fprintf(out, "sent %d bytes to %s\n", len(args[1]), name)
+	_, _ = fmt.Fprintf(out, "sent %d bytes to %s\n", len(payload.data), name)
 	return nil
+}
+
+type cliPayload struct {
+	data []byte
+	text string
+}
+
+func parseSendPayload(args []string) (cliPayload, error) {
+	var hexMode bool
+	var rawFile string
+	var hexFile string
+	var tokens []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-x", "--hex":
+			hexMode = true
+		case "--file":
+			if i+1 >= len(args) {
+				return cliPayload{}, errors.New("--file requires a path")
+			}
+			rawFile = args[i+1]
+			i++
+		case "--xfile":
+			if i+1 >= len(args) {
+				return cliPayload{}, errors.New("--xfile requires a path")
+			}
+			hexFile = args[i+1]
+			i++
+		default:
+			tokens = append(tokens, args[i])
+		}
+	}
+	return payloadFromSources(tokens, hexMode, rawFile, hexFile, "send")
+}
+
+func (a *App) sendSerialPayload(port string, baud int, payload cliPayload) error {
+	if a.deps.SendSerialPayload != nil {
+		return a.deps.SendSerialPayload(port, baud, payload.data)
+	}
+	return a.deps.SendSerial(port, baud, payloadText(payload))
+}
+
+func (a *App) sendSessionPayload(address string, payload cliPayload) error {
+	if a.deps.SendSessionPayload != nil {
+		return a.deps.SendSessionPayload(address, payload.data)
+	}
+	return a.deps.SendSession(address, payloadText(payload))
+}
+
+func payloadText(payload cliPayload) string {
+	if payload.text != "" || len(payload.data) == 0 {
+		return payload.text
+	}
+	return string(payload.data)
 }
 
 func (a *App) runAsk(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return a.usage("ask <session> <data> [-t seconds] [-l lines]")
+		return a.usage("ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
 		return err
 	}
-	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	timeoutSeconds := fs.Float64("t", 0.5, "read response window in seconds")
-	maxLines := fs.Int("l", 50, "print the last N response lines; 0 means unlimited")
-	if err := fs.Parse(args[2:]); err != nil {
+	payload, ask, err := parseAskPayload(args[1:])
+	if err != nil {
 		return err
-	}
-	if fs.NArg() != 0 {
-		return a.usage("ask <session> <data> [-t seconds] [-l lines]")
-	}
-	if *timeoutSeconds <= 0 {
-		return errors.New("ask timeout must be positive")
-	}
-	if *maxLines < 0 {
-		return errors.New("ask line limit must not be negative")
 	}
 	if a.deps.Store.Dir == "" {
 		if a.deps.AskSerial == nil {
@@ -509,10 +559,13 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 			return nil
 		}
 		return a.deps.AskSerial(serialcmd.AskOptions{
-			Data:     args[1],
-			Timeout:  time.Duration(*timeoutSeconds * float64(time.Second)),
-			MaxLines: *maxLines,
-			Output:   out,
+			Data:           payload.text,
+			Payload:        payload.data,
+			Timeout:        ask.timeout,
+			MaxLines:       ask.maxLines,
+			Output:         out,
+			OutputHex:      ask.hexMode,
+			ShowTimestamps: ask.showTimestamps,
 		})
 	}
 	state, err := a.deps.Store.Load(name)
@@ -525,10 +578,10 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 	if address, ok, err := sessionDialAddress(state); err != nil {
 		return err
 	} else if ok {
-		if a.deps.SendSession == nil {
+		if a.deps.SendSession == nil && a.deps.SendSessionPayload == nil {
 			return errors.New("session sender is unavailable")
 		}
-		return a.askViaSessionWorker(state, address, args[1], time.Duration(*timeoutSeconds*float64(time.Second)), *maxLines, out)
+		return a.askViaSessionWorker(state, address, payload, ask, out)
 	}
 	if state.Status == session.StatusSharing {
 		return a.sharedControlUnavailable()
@@ -537,33 +590,157 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 		return errors.New("serial ask is unavailable")
 	}
 	return a.deps.AskSerial(serialcmd.AskOptions{
-		Port:      state.Port,
-		Baud:      state.Baud,
-		Data:      args[1],
-		Timeout:   time.Duration(*timeoutSeconds * float64(time.Second)),
-		MaxLines:  *maxLines,
-		Output:    out,
-		CachePath: a.deps.Store.CachePath(name),
+		Port:           state.Port,
+		Baud:           state.Baud,
+		Data:           payload.text,
+		Payload:        payload.data,
+		Timeout:        ask.timeout,
+		MaxLines:       ask.maxLines,
+		Output:         out,
+		OutputHex:      ask.hexMode,
+		ShowTimestamps: ask.showTimestamps,
+		CachePath:      a.deps.Store.CachePath(name),
+		CacheIndexPath: a.deps.Store.CacheIndexPath(name),
 	})
 }
 
-func (a *App) askViaSessionWorker(state session.State, address string, data string, timeout time.Duration, maxLines int, out io.Writer) error {
+type askFlags struct {
+	timeout        time.Duration
+	maxLines       int
+	hexMode        bool
+	showTimestamps bool
+}
+
+func parseAskPayload(args []string) (cliPayload, askFlags, error) {
+	flags := askFlags{timeout: 500 * time.Millisecond, maxLines: 50}
+	var rawFile string
+	var hexFile string
+	var tokens []string
+	lineLimitSet := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-x", "--hex":
+			flags.hexMode = true
+		case "-T", "--ts":
+			flags.showTimestamps = true
+		case "-t", "--timeout":
+			if i+1 >= len(args) {
+				return cliPayload{}, askFlags{}, errors.New("-t requires seconds")
+			}
+			seconds, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil {
+				return cliPayload{}, askFlags{}, fmt.Errorf("invalid ask timeout %q", args[i+1])
+			}
+			flags.timeout = time.Duration(seconds * float64(time.Second))
+			i++
+		case "-l", "--lines":
+			if i+1 >= len(args) {
+				return cliPayload{}, askFlags{}, errors.New("-l requires lines")
+			}
+			lines, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return cliPayload{}, askFlags{}, fmt.Errorf("invalid ask line limit %q", args[i+1])
+			}
+			flags.maxLines = lines
+			lineLimitSet = true
+			i++
+		case "--file":
+			if i+1 >= len(args) {
+				return cliPayload{}, askFlags{}, errors.New("--file requires a path")
+			}
+			rawFile = args[i+1]
+			i++
+		case "--xfile":
+			if i+1 >= len(args) {
+				return cliPayload{}, askFlags{}, errors.New("--xfile requires a path")
+			}
+			hexFile = args[i+1]
+			i++
+		default:
+			tokens = append(tokens, args[i])
+		}
+	}
+	if flags.timeout <= 0 {
+		return cliPayload{}, askFlags{}, errors.New("ask timeout must be positive")
+	}
+	if flags.maxLines < 0 {
+		return cliPayload{}, askFlags{}, errors.New("ask line limit must not be negative")
+	}
+	if flags.hexMode && lineLimitSet {
+		return cliPayload{}, askFlags{}, errors.New("ask -l is not supported with -x")
+	}
+	payload, err := payloadFromSources(tokens, flags.hexMode, rawFile, hexFile, "ask")
+	return payload, flags, err
+}
+
+func payloadFromSources(tokens []string, hexMode bool, rawFile string, hexFile string, command string) (cliPayload, error) {
+	sources := 0
+	if hexMode {
+		sources++
+	}
+	if rawFile != "" {
+		sources++
+	}
+	if hexFile != "" {
+		sources++
+	}
+	if !hexMode && rawFile == "" && hexFile == "" && len(tokens) > 0 {
+		sources++
+	}
+	if sources != 1 {
+		return cliPayload{}, fmt.Errorf("%s requires exactly one payload source", command)
+	}
+	switch {
+	case rawFile != "":
+		data, err := serialcmd.ReadRawPayloadFile(rawFile)
+		return cliPayload{data: data}, err
+	case hexFile != "":
+		data, err := serialcmd.ReadHexPayloadFile(hexFile)
+		return cliPayload{data: data}, err
+	case hexMode:
+		data, err := serialcmd.ParseHexPayload(tokens)
+		return cliPayload{data: data}, err
+	default:
+		if len(tokens) != 1 {
+			return cliPayload{}, fmt.Errorf("%s text payload requires exactly one data argument", command)
+		}
+		data, err := serialcmd.ParseTextPayload(tokens[0])
+		return cliPayload{data: data, text: tokens[0]}, err
+	}
+}
+
+func (a *App) askViaSessionWorker(state session.State, address string, payload cliPayload, ask askFlags, out io.Writer) error {
 	cachePath := a.deps.Store.CachePath(state.Name)
 	start := cacheSize(cachePath)
-	if err := a.deps.SendSession(address, data); err != nil {
+	if err := a.sendSessionPayload(address, payload); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(ask.timeout)
 	next := start
-	var response bytes.Buffer
+	var response []serialcmd.TimedChunk
 	for {
-		end, err := copyCacheBytes(cachePath, &response, next)
+		var chunk bytes.Buffer
+		end, err := copyCacheBytes(cachePath, &chunk, next)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		if chunk.Len() > 0 {
+			timed := serialcmd.ReadTimedChunks(cachePath, a.deps.Store.CacheIndexPath(state.Name), next, chunk.Bytes())
+			if ask.hexMode {
+				if _, err := out.Write(serialcmd.FormatHexChunks(timed, ask.showTimestamps)); err != nil {
+					return err
+				}
+			} else {
+				response = append(response, timed...)
+			}
+		}
 		next = end
 		if time.Now().After(deadline) {
-			_, err := out.Write(lastLines(response.Bytes(), maxLines))
+			if ask.hexMode {
+				return nil
+			}
+			response = serialcmd.LastLineChunks(response, ask.maxLines)
+			_, err := out.Write(serialcmd.FormatTextChunks(response, ask.showTimestamps))
 			return err
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -816,7 +993,7 @@ func (a *App) runStream(name string, opts serialcmd.StreamOptions, out io.Writer
 
 func (a *App) runRead(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return a.usage("read <session> [-n count] [--to file]")
+		return a.usage("read <session> [-x] [-T] [-n count] [--to file]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -826,11 +1003,15 @@ func (a *App) runRead(args []string, out io.Writer) error {
 	fs.SetOutput(io.Discard)
 	n := fs.Int("n", 0, "read last n bytes")
 	to := fs.String("to", "", "write cached data to file")
+	outputHex := fs.Bool("x", false, "format cached data as hex")
+	fs.BoolVar(outputHex, "hex", false, "format cached data as hex")
+	showTimestamps := fs.Bool("T", false, "show chunk timestamps")
+	fs.BoolVar(showTimestamps, "ts", false, "show chunk timestamps")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return a.usage("read <session> [-n count] [--to file]")
+		return a.usage("read <session> [-x] [-T] [-n count] [--to file]")
 	}
 	if *n < 0 {
 		return errors.New("read count must not be negative")
@@ -838,6 +1019,43 @@ func (a *App) runRead(args []string, out io.Writer) error {
 	if a.deps.Store.Dir != "" {
 		cachePath := a.deps.Store.CachePath(name)
 		if *to != "" {
+			if *showTimestamps {
+				data, start, err := readLastCacheBytesWithStart(cachePath, int64(*n))
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						_, _ = fmt.Fprintln(out, "no cached data")
+						return nil
+					}
+					return err
+				}
+				chunks := serialcmd.ReadTimedChunks(cachePath, a.deps.Store.CacheIndexPath(name), start, data)
+				var formatted []byte
+				if *outputHex {
+					formatted = serialcmd.FormatHexChunks(chunks, true)
+				} else {
+					formatted = serialcmd.FormatTextChunks(chunks, true)
+				}
+				if err := writeOutputFile(*to, formatted); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(out, "wrote %d bytes to %s\n", len(data), *to)
+				return nil
+			}
+			if *outputHex {
+				data, err := readLastCacheBytes(cachePath, int64(*n))
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						_, _ = fmt.Fprintln(out, "no cached data")
+						return nil
+					}
+					return err
+				}
+				if err := writeOutputFile(*to, []byte(serialcmd.FormatHexBytes(data))); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(out, "wrote %d bytes to %s\n", len(data), *to)
+				return nil
+			}
 			written, err := copyCacheToFile(cachePath, *to, int64(*n))
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
@@ -859,6 +1077,20 @@ func (a *App) runRead(args []string, out io.Writer) error {
 		}
 		if *n > 0 && len(data) > *n {
 			data = data[len(data)-*n:]
+		}
+		start := cacheSize(cachePath) - int64(len(data))
+		if *showTimestamps {
+			chunks := serialcmd.ReadTimedChunks(cachePath, a.deps.Store.CacheIndexPath(name), start, data)
+			if *outputHex {
+				_, _ = out.Write(serialcmd.FormatHexChunks(chunks, true))
+				return nil
+			}
+			_, _ = out.Write(serialcmd.FormatTextChunks(chunks, true))
+			return nil
+		}
+		if *outputHex {
+			_, _ = out.Write([]byte(serialcmd.FormatHexBytes(data)))
+			return nil
 		}
 		_, _ = out.Write(data)
 		return nil
@@ -903,9 +1135,37 @@ func copyCacheToFile(cachePath string, destPath string, lastBytes int64) (int64,
 	return io.Copy(out, in)
 }
 
+func readLastCacheBytes(cachePath string, lastBytes int64) ([]byte, error) {
+	data, _, err := readLastCacheBytesWithStart(cachePath, lastBytes)
+	return data, err
+}
+
+func readLastCacheBytesWithStart(cachePath string, lastBytes int64) ([]byte, int64, error) {
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, 0, err
+	}
+	start := int64(0)
+	if lastBytes > 0 && int64(len(data)) > lastBytes {
+		start = int64(len(data)) - lastBytes
+		data = data[start:]
+	}
+	return data, start, nil
+}
+
+func writeOutputFile(path string, data []byte) error {
+	file, err := createOutputFile(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(data)
+	return err
+}
+
 func (a *App) runCheck(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return a.usage("check <session> [-n count] [--from offset] [--rewind count] [--to file]")
+		return a.usage("check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -917,11 +1177,13 @@ func (a *App) runCheck(args []string, out io.Writer) error {
 	from := fs.Int64("from", -1, "read from absolute cache offset")
 	rewind := fs.Int64("rewind", 0, "move cursor back before reading")
 	to := fs.String("to", "", "write checked data to file")
+	outputHex := fs.Bool("x", false, "format checked data as hex")
+	fs.BoolVar(outputHex, "hex", false, "format checked data as hex")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return a.usage("check <session> [-n count] [--from offset] [--rewind count] [--to file]")
+		return a.usage("check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]")
 	}
 	if *n < 0 {
 		return errors.New("check count must not be negative")
@@ -949,7 +1211,7 @@ func (a *App) runCheck(args []string, out io.Writer) error {
 			start = 0
 		}
 	}
-	end, written, err := copyCacheRange(a.deps.Store.CachePath(name), out, *to, start, *n)
+	end, written, err := copyCacheRange(a.deps.Store.CachePath(name), out, *to, start, *n, *outputHex)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_, _ = fmt.Fprintln(out, "no cached data")
@@ -967,7 +1229,7 @@ func (a *App) runCheck(args []string, out io.Writer) error {
 	return nil
 }
 
-func copyCacheRange(cachePath string, terminalOut io.Writer, destPath string, start int64, maxBytes int64) (int64, int64, error) {
+func copyCacheRange(cachePath string, terminalOut io.Writer, destPath string, start int64, maxBytes int64, outputHex bool) (int64, int64, error) {
 	in, err := os.Open(cachePath)
 	if err != nil {
 		return 0, 0, err
@@ -990,6 +1252,23 @@ func copyCacheRange(cachePath string, terminalOut io.Writer, destPath string, st
 	}
 	if _, err := in.Seek(start, io.SeekStart); err != nil {
 		return 0, 0, err
+	}
+	if outputHex {
+		data := make([]byte, end-start)
+		n, err := io.ReadFull(in, data)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, int64(n), err
+		}
+		data = data[:n]
+		formatted := []byte(serialcmd.FormatHexBytes(data))
+		if destPath != "" {
+			if err := writeOutputFile(destPath, formatted); err != nil {
+				return 0, int64(n), err
+			}
+		} else if _, err := terminalOut.Write(formatted); err != nil {
+			return 0, int64(n), err
+		}
+		return start + int64(n), int64(n), nil
 	}
 	var out io.Writer = terminalOut
 	var closeOut func() error
@@ -1042,6 +1321,9 @@ func (a *App) runClear(args []string, out io.Writer) error {
 			return err
 		}
 		if err := os.WriteFile(a.deps.Store.CachePath(name), nil, 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(a.deps.Store.CacheIndexPath(name), nil, 0o644); err != nil {
 			return err
 		}
 		state, err := a.deps.Store.Load(name)
@@ -1369,6 +1651,7 @@ func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 			Port:           state.Port,
 			Baud:           state.Baud,
 			CachePath:      a.deps.Store.CachePath(name),
+			CacheIndexPath: a.deps.Store.CacheIndexPath(name),
 		})
 	})
 }
@@ -1421,6 +1704,7 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 				HubPorts:       append([]string(nil), state.HubPorts...),
 				Baud:           state.Baud,
 				CachePath:      a.deps.Store.CachePath(name),
+				CacheIndexPath: a.deps.Store.CacheIndexPath(name),
 				ControlAddress: controlAddress,
 				TCPAddress:     state.TCPAddress,
 				OnListening: func(address string) {
@@ -1434,10 +1718,11 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.StreamSerial(serialcmd.StreamOptions{
-			Port:      state.Port,
-			Baud:      state.Baud,
-			Output:    io.Discard,
-			CachePath: a.deps.Store.CachePath(name),
+			Port:           state.Port,
+			Baud:           state.Baud,
+			Output:         io.Discard,
+			CachePath:      a.deps.Store.CachePath(name),
+			CacheIndexPath: a.deps.Store.CacheIndexPath(name),
 		})
 	})
 }
@@ -1483,10 +1768,11 @@ func (a *App) runWorkerTCP(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.BridgeTCP(serialcmd.TCPBridgeOptions{
-			ListenAddress: state.TCPAddress,
-			Port:          state.Port,
-			Baud:          state.Baud,
-			CachePath:     a.deps.Store.CachePath(name),
+			ListenAddress:  state.TCPAddress,
+			Port:           state.Port,
+			Baud:           state.Baud,
+			CachePath:      a.deps.Store.CachePath(name),
+			CacheIndexPath: a.deps.Store.CacheIndexPath(name),
 			OnListening: func(address string) {
 				appendWorkerLog("worker ready listen=" + address)
 			},
@@ -1896,10 +2182,12 @@ Usage:
   %[1]s -v
   %[1]s ports
   %[1]s open <session> <port> [-b baud]
-  %[1]s send <session> <data>
-  %[1]s ask <session> <data> [-t seconds] [-l lines]
-  %[1]s read <session> [-n count] [--to file]
-  %[1]s check <session> [-n count] [--from offset] [--rewind count] [--to file]
+  %[1]s send <session> [-x] <data...>
+  %[1]s send <session> --file <file>
+  %[1]s send <session> --xfile <file>
+  %[1]s ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]
+  %[1]s read <session> [-x] [-T] [-n count] [--to file]
+  %[1]s check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]
   %[1]s clear <session>
   %[1]s clear --share
   %[1]s shell <session>

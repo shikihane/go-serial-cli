@@ -36,11 +36,17 @@ sio ports
 sio open dev1 COM3 -b 115200
 sio send dev1 "AT\r\n"
 sio send dev1 "\x03"
+sio send dev1 -x 01 0a 02 0f af
+sio send dev1 --file payload.bin
+sio send dev1 --xfile payload.hex
 sio ask dev1 "AT\r\n"
 sio ask dev1 "ATI\r\n" -t 1.5 -l 5
+sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 sio read dev1 -n 200
+sio read dev1 -x -n 200
 sio read dev1 --to serial-cache.log
 sio check dev1 -n 200
+sio check dev1 -x
 sio check dev1 --rewind 2000
 sio check dev1 --from 0 --to checked.log
 sio clear dev1
@@ -79,13 +85,27 @@ sio send dev1 "\x04"  # Ctrl+D
 
 Do not treat bare `^C` as special. It is ordinary payload text. In `sio shell`, use escaped line endings such as `AT\r\n` when the device expects CRLF.
 
-`sio ask <session> <data>` sends one payload and immediately reads fresh response data. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. When a session worker is running, `sio ask` sends through that worker and reads only newly cached output after the send.
+Use `-x` / `--hex` for binary protocols:
+
+```bash
+sio send dev1 -x 01 0a 02 0f af
+sio send dev1 -x "AA BB 1C"
+sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
+```
+
+Hex input accepts whitespace, newlines, commas, hyphens, compact bytes, and `0x` prefixes. Empty or invalid hex is an error. Use `--file <path>` to send file bytes exactly as stored, without escape parsing or added line endings. Use `--xfile <path>` to read hex text from a file and send decoded bytes.
+
+`sio ask <session> <data>` sends one payload and immediately reads fresh response data. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. Add `-T` / `--ts` to show timestamps for emitted lines or hex frames. When a session worker is running, `sio ask` sends through that worker and reads only newly cached output after the send.
+
+With `sio ask -x`, the request is hex and the response is printed as lower-case, space-separated hex. Do not use `-l` with `ask -x`; line limits are text-only.
 
 ## Cache Semantics
 
-`sio read` is a non-destructive cache viewer. It never advances a cursor, consumes bytes, or truncates the cache. Prefer `--to <file>` for large output so the CLI streams data into a file instead of dumping it to the terminal; combine `-n` with `--to` to export only the last N bytes.
+`sio read` is a non-destructive cache viewer. It never advances a cursor, consumes bytes, or truncates the cache. Add `-T` / `--ts` to show recorded cache chunk timestamps while leaving `cache.log` raw. Prefer `--to <file>` for large output so the CLI streams data into a file instead of dumping it to the terminal; combine `-n` with `--to` to export only the last N bytes.
 
 `sio check` is incremental polling. It reads from the saved check cursor and advances that cursor only to the bytes emitted. Use `--rewind <bytes>` to back up from the saved cursor, or `--from <offset>` to inspect from an absolute cache offset. `sio clear <session>` clears `cache.log` and resets the check cursor.
+
+Use `sio read -x` or `sio check -x` when cached data is binary. Hex output is lower-case, two-digit, and space-separated. With `--to <file>`, hex mode writes formatted hex text to the file, not raw cache bytes.
 
 `sio open` starts a session worker that owns the physical serial port and appends output to the cache until `sio stop` or `sio rm`. Other owners with readable serial streams, including `sio tee`, `sio tcp`, and sharing workers, also append output to the cache while they own the stream.
 

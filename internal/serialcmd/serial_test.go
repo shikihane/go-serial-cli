@@ -12,6 +12,29 @@ import (
 	"time"
 )
 
+func assertTimestampedLines(t *testing.T, got string, wantPayloads []string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if len(lines) != len(wantPayloads) {
+		t.Fatalf("line count = %d, want %d in %q", len(lines), len(wantPayloads), got)
+	}
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		const timestampLen = len("06-01-02 15:04:05.000")
+		if len(line) <= timestampLen || line[timestampLen] != ' ' {
+			t.Fatalf("line %q does not contain compact timestamp and payload", line)
+		}
+		timestamp := line[:timestampLen]
+		if _, err := time.ParseInLocation("06-01-02 15:04:05.000", timestamp, time.Local); err != nil {
+			t.Fatalf("timestamp %q did not parse: %v", timestamp, err)
+		}
+		payload := line[timestampLen+1:]
+		if payload != wantPayloads[i] {
+			t.Fatalf("line payload = %q, want %q", payload, wantPayloads[i])
+		}
+	}
+}
+
 func TestCopyInputToPortWritesUnescapedLines(t *testing.T) {
 	input := bytes.NewBufferString("AT\\r\\n\n")
 	var port bytes.Buffer
@@ -31,6 +54,88 @@ func TestUnescapeSupportsHexAndControlEscapes(t *testing.T) {
 
 	if got != want {
 		t.Fatalf("unescape = %q, want %q", got, want)
+	}
+}
+
+func TestParseHexPayloadAcceptsCommonFormats(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+		want  []byte
+	}{
+		{name: "spaced lower", input: []string{"01 0a 02 0f af"}, want: []byte{0x01, 0x0a, 0x02, 0x0f, 0xaf}},
+		{name: "separate args", input: []string{"01", "0a", "02", "0f", "af"}, want: []byte{0x01, 0x0a, 0x02, 0x0f, 0xaf}},
+		{name: "0x prefixes", input: []string{"0x01", "0X0A", "0xAF"}, want: []byte{0x01, 0x0a, 0xaf}},
+		{name: "uppercase", input: []string{"AA BB 1C"}, want: []byte{0xaa, 0xbb, 0x1c}},
+		{name: "compact", input: []string{"010a020faf"}, want: []byte{0x01, 0x0a, 0x02, 0x0f, 0xaf}},
+		{name: "comma and hyphen", input: []string{"01,0a-02"}, want: []byte{0x01, 0x0a, 0x02}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseHexPayload(tt.input)
+			if err != nil {
+				t.Fatalf("ParseHexPayload returned error: %v", err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Fatalf("payload = % x, want % x", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseHexPayloadRejectsEmptyAndInvalidInput(t *testing.T) {
+	tests := [][]string{
+		nil,
+		{""},
+		{"  , -  "},
+		{"0x"},
+		{"0"},
+		{"zz"},
+		{"01 // comment"},
+	}
+	for _, input := range tests {
+		if _, err := ParseHexPayload(input); err == nil {
+			t.Fatalf("ParseHexPayload(%q) returned nil, want error", input)
+		}
+	}
+}
+
+func TestReadRawPayloadFilePreservesBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payload.bin")
+	want := []byte{0x00, 0x41, 0x0d, 0x0a, 0xff}
+	if err := os.WriteFile(path, want, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	got, err := ReadRawPayloadFile(path)
+	if err != nil {
+		t.Fatalf("ReadRawPayloadFile returned error: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload = % x, want % x", got, want)
+	}
+}
+
+func TestReadHexPayloadFileParsesText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payload.hex")
+	if err := os.WriteFile(path, []byte("01 0a\n0x02,ff"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	got, err := ReadHexPayloadFile(path)
+	if err != nil {
+		t.Fatalf("ReadHexPayloadFile returned error: %v", err)
+	}
+	want := []byte{0x01, 0x0a, 0x02, 0xff}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload = % x, want % x", got, want)
+	}
+}
+
+func TestFormatHexBytes(t *testing.T) {
+	if got := FormatHexBytes([]byte{0x01, 0x0a, 0xff}); got != "01 0a ff\n" {
+		t.Fatalf("FormatHexBytes = %q", got)
+	}
+	if got := FormatHexBytes(nil); got != "" {
+		t.Fatalf("FormatHexBytes(nil) = %q, want empty", got)
 	}
 }
 
@@ -210,6 +315,97 @@ func TestAskStopsAfterTimeoutWhenLineLimitIsZero(t *testing.T) {
 	if got := port.waitWritten(t); got != string([]byte{0x03}) {
 		t.Fatalf("written data = %q, want Ctrl+C", got)
 	}
+}
+
+func TestAskFormatsHexResponse(t *testing.T) {
+	port := newMemorySerialPort()
+	cachePath := filepath.Join(t.TempDir(), "cache.log")
+	var out bytes.Buffer
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Ask(AskOptions{
+			Port:      "COM3",
+			Baud:      115200,
+			Payload:   []byte{0x01, 0x02},
+			Timeout:   time.Second,
+			MaxLines:  0,
+			Output:    &out,
+			OutputHex: true,
+			CachePath: cachePath,
+			OpenPort: func(portName string, baud int) (SerialPort, error) {
+				return port, nil
+			},
+		})
+	}()
+
+	if got := port.waitWritten(t); got != "\x01\x02" {
+		t.Fatalf("written = %q", got)
+	}
+	port.injectRead("OK")
+	port.injectRead("\r\n")
+	time.Sleep(20 * time.Millisecond)
+	if err := port.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Ask returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ask did not return after injected response")
+	}
+	if out.String() != "4f 4b\n0d 0a\n" {
+		t.Fatalf("output = %q, want per-read hex response", out.String())
+	}
+	assertFileContent(t, cachePath, "OK\r\n")
+}
+
+func TestAskFormatsHexResponseWithTimestamps(t *testing.T) {
+	port := newMemorySerialPort()
+	cachePath := filepath.Join(t.TempDir(), "cache.log")
+	var out bytes.Buffer
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Ask(AskOptions{
+			Port:           "COM3",
+			Baud:           115200,
+			Payload:        []byte{0x01, 0x02},
+			Timeout:        time.Second,
+			MaxLines:       0,
+			Output:         &out,
+			OutputHex:      true,
+			ShowTimestamps: true,
+			CachePath:      cachePath,
+			OpenPort: func(portName string, baud int) (SerialPort, error) {
+				return port, nil
+			},
+		})
+	}()
+
+	if got := port.waitWritten(t); got != "\x01\x02" {
+		t.Fatalf("written = %q", got)
+	}
+	port.injectRead("OK")
+	port.injectRead("\r\n")
+	time.Sleep(20 * time.Millisecond)
+	if err := port.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Ask returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ask did not return after injected response")
+	}
+	assertTimestampedLines(t, out.String(), []string{"4f 4b", "0d 0a"})
+	assertFileContent(t, cachePath, "OK\r\n")
 }
 
 func TestBridgeTCPMovesDataBetweenClientAndSerialPort(t *testing.T) {

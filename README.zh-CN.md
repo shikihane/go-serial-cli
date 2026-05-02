@@ -278,8 +278,14 @@ sio send dev1 "\x03"
 sio send dev1 "\cC"
 sio send dev1 "\x1b"
 sio send dev1 "\x04"
+sio send dev1 -x 01 0a 02 0f af
+sio send dev1 -x "AA BB 1C"
+sio send dev1 --file payload.bin
+sio send dev1 --xfile payload.hex
 sio ask dev1 "AT\r\n"
 sio ask dev1 "ATI\r\n" -t 1.5 -l 5
+sio ask dev1 "ATI\r\n" -T
+sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 ```
 
 payload 支持显式转义：
@@ -294,9 +300,11 @@ payload 支持显式转义：
 
 `^C` 这样的裸写法只是普通文本。这样可以让字面 payload 保持明确。
 
+二进制协议可以用 `-x` / `--hex` 直接解析十六进制字节。十六进制输入支持空白、逗号、连字符、紧凑字节和 `0x` 前缀。`--file` 会按文件原始字节发送，不解析转义，也不追加行尾。`--xfile` 读取包含十六进制文本的文件，并发送解码后的字节。
+
 `sio ask` 会发送一个 payload，然后在短时间窗口内读取新的串口回传。默认窗口是 0.5 秒，
 默认输出最后 50 行。用 `-t <seconds>` 调整窗口，用 `-l <lines>` 输出最后 N 行。
-`-l 0` 表示不限制行数。
+`-l 0` 表示不限制行数。使用 `ask -x` 时，请求按十六进制解析，响应也按小写十六进制输出；`-l` 只适用于文本模式，hex 模式会拒绝它。用 `-T` / `--ts` 可以在文本模式显示逐行时间戳，或在 hex 模式显示逐帧/分块时间戳。
 
 ### 读取缓存输出
 
@@ -305,6 +313,9 @@ sio read dev1 -n 200
 sio read dev1 --to serial-cache.log
 sio read dev1 -n 4096 --to recent.log
 sio check dev1 -n 200
+sio read dev1 -T
+sio read dev1 -x -n 200
+sio check dev1 -x
 sio check dev1 --rewind 2000
 sio check dev1 --from 0 --to checked.log
 sio clear dev1
@@ -315,6 +326,10 @@ sio clear dev1
 `sio check` 是增量读取。它从保存的 check 游标开始读取，并且只把游标推进到已输出的字节。用 `--rewind <bytes>` 从保存游标回退，或用 `--from <offset>` 从绝对缓存偏移检查。
 
 大输出建议使用 `--to <file>`，让 CLI 把数据流式写入文件，而不是倾倒到终端。
+
+`read` 和 `check` 可使用 `-x` / `--hex` 把缓存字节格式化为小写、空格分隔的十六进制。与 `--to` 组合时，目标文件写入的是格式化后的十六进制文本，而不是原始缓存字节。
+
+用 `read -T` / `read --ts` 可以显示缓存输出对应的分块时间戳。`cache.log` 仍然保持原始字节，时间戳元数据保存在旁边的索引文件里。
 
 ### 实时 owner
 

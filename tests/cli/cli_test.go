@@ -24,6 +24,29 @@ func wantPairs(t *testing.T, got []cli.VirtualPortPair, want []cli.VirtualPortPa
 	}
 }
 
+func assertTimestampedLines(t *testing.T, got string, wantPayloads []string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if len(lines) != len(wantPayloads) {
+		t.Fatalf("line count = %d, want %d in %q", len(lines), len(wantPayloads), got)
+	}
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		const timestampLen = len("06-01-02 15:04:05.000")
+		if len(line) <= timestampLen || line[timestampLen] != ' ' {
+			t.Fatalf("line %q does not contain compact timestamp and payload", line)
+		}
+		timestamp := line[:timestampLen]
+		if _, err := time.ParseInLocation("06-01-02 15:04:05.000", timestamp, time.Local); err != nil {
+			t.Fatalf("timestamp %q did not parse: %v", timestamp, err)
+		}
+		payload := line[timestampLen+1:]
+		if payload != wantPayloads[i] {
+			t.Fatalf("line payload = %q, want %q", payload, wantPayloads[i])
+		}
+	}
+}
+
 type interruptingReader struct {
 	err           error
 	allowNextRead chan struct{}
@@ -147,6 +170,12 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"built_at=2026-04-29T06:20:00Z",
 		"sio version",
 		"sio -v",
+		"sio send <session> [-x] <data...>",
+		"sio send <session> --file <file>",
+		"sio send <session> --xfile <file>",
+		"sio ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]",
+		"sio read <session> [-x] [-T] [-n count] [--to file]",
+		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help output %q does not contain %q", got, want)
@@ -1021,6 +1050,111 @@ func TestSendUsesNamedSession(t *testing.T) {
 	}
 }
 
+func TestSendHexUsesNamedSession(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if port != "COM3" || baud != 115200 {
+				t.Fatalf("port/baud = %q/%d", port, baud)
+			}
+			if !bytes.Equal(payload, []byte{0x01, 0x0a, 0x02, 0x0f, 0xaf}) {
+				t.Fatalf("payload = % x", payload)
+			}
+			return nil
+		},
+	})
+	if err := app.Run([]string{"send", "dev1", "-x", "01", "0a", "02", "0f", "af"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendHexAcceptsQuotedPayload(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, []byte{0xaa, 0xbb, 0x1c}) {
+				t.Fatalf("payload = % x", payload)
+			}
+			return nil
+		},
+	})
+	if err := app.Run([]string{"send", "dev1", "--hex", "AA BB 1C"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendRawFilePreservesBytes(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "payload.bin")
+	want := []byte{0x00, '\\', 'r', '\\', 'n', 0xff}
+	if err := os.WriteFile(path, want, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, want) {
+				t.Fatalf("payload = % x, want % x", payload, want)
+			}
+			return nil
+		},
+	})
+	if err := app.Run([]string{"send", "dev1", "--file", path}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendHexFileParsesPayload(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "payload.hex")
+	if err := os.WriteFile(path, []byte("01 0a\n0x02-ff"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, []byte{0x01, 0x0a, 0x02, 0xff}) {
+				t.Fatalf("payload = % x", payload)
+			}
+			return nil
+		},
+	})
+	if err := app.Run([]string{"send", "dev1", "--xfile", path}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendRejectsConflictingPayloadSources(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+	err := app.Run([]string{"send", "dev1", "-x", "01", "--file", "payload.bin"}, &out)
+	if err == nil {
+		t.Fatal("Run returned nil, want conflicting payload source error")
+	}
+}
+
 func TestSendUsesControlChannelWhenSessionIsShared(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -1216,6 +1350,116 @@ func TestAskAcceptsTimeoutAndLineLimit(t *testing.T) {
 	}
 }
 
+func TestAskHexUsesNamedSessionAndFormatsResponse(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		AskSerial: func(opts serialcmd.AskOptions) error {
+			if !bytes.Equal(opts.Payload, []byte{0x01, 0x03, 0x00, 0x00}) {
+				t.Fatalf("payload = % x", opts.Payload)
+			}
+			if !opts.OutputHex {
+				t.Fatal("OutputHex = false, want true")
+			}
+			_, _ = opts.Output.Write([]byte(serialcmd.FormatHexBytes([]byte{0x01, 0x03, 0x02, 0x00, 0x2a})))
+			return nil
+		},
+	})
+	if err := app.Run([]string{"ask", "dev1", "-x", "-t", "1", "01", "03", "00", "00"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "01 03 02 00 2a\n" {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestAskHexRejectsLineLimit(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+	err := app.Run([]string{"ask", "dev1", "-x", "-l", "5", "01"}, &out)
+	if err == nil {
+		t.Fatal("Run returned nil, want -l rejection in hex mode")
+	}
+	if !strings.Contains(err.Error(), "ask -l is not supported with -x") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestAskHexWorkerControlReadsNewCacheAsHex(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("old"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSessionPayload: func(address string, payload []byte) error {
+			if !bytes.Equal(payload, []byte{0x01, 0x02}) {
+				t.Fatalf("payload = % x", payload)
+			}
+			if err := os.WriteFile(store.CachePath("dev1"), append([]byte("old"), 0x03), 0o644); err != nil {
+				return err
+			}
+			go func() {
+				time.Sleep(40 * time.Millisecond)
+				_ = os.WriteFile(store.CachePath("dev1"), append([]byte("old"), 0x03, 0x04), 0o644)
+			}()
+			return nil
+		},
+	})
+	if err := app.Run([]string{"ask", "dev1", "-x", "-t", "0.12", "01", "02"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "03\n04\n" {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestAskHexWorkerControlShowsChunkTimestamps(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("old"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSessionPayload: func(address string, payload []byte) error {
+			if err := os.WriteFile(store.CachePath("dev1"), append([]byte("old"), 0x03), 0o644); err != nil {
+				return err
+			}
+			go func() {
+				time.Sleep(40 * time.Millisecond)
+				_ = os.WriteFile(store.CachePath("dev1"), append([]byte("old"), 0x03, 0x04), 0o644)
+			}()
+			return nil
+		},
+	})
+	if err := app.Run([]string{"ask", "dev1", "-x", "-T", "-t", "0.12", "01", "02"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{"03", "04"})
+}
+
 func TestAskUsesWorkerControlChannelAndReadsNewCache(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -1275,6 +1519,31 @@ func TestAskWorkerControlChannelReturnsLastLines(t *testing.T) {
 	if out.String() != "two\r\nthree\r\n" {
 		t.Fatalf("output = %q, want last two lines", out.String())
 	}
+}
+
+func TestAskWorkerControlChannelShowsLineTimestamps(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSession: func(address string, data string) error {
+			return os.WriteFile(store.CachePath("dev1"), []byte("old\none\r\ntwo\r\nthree\r\n"), 0o644)
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n", "-T", "-t", "0.01", "-l", "2"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{"two", "three"})
 }
 
 func TestReadWritesCacheToFile(t *testing.T) {
@@ -1362,6 +1631,72 @@ func TestReadDoesNotAdvanceCheckCursor(t *testing.T) {
 	}
 }
 
+func TestReadShowsLineTimestamps(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("first\nsecond\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+	if err := app.Run([]string{"read", "dev1", "-T"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{"first", "second"})
+}
+
+func TestReadHexPrintsLastBytesAsHex(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte{0x00, 0x01, 0x0a, 0xff}, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+	if err := app.Run([]string{"read", "dev1", "-x", "-n", "3"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "01 0a ff\n" {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestReadHexWritesFormattedOutputToFile(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte{0x01, 0x02}, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	dest := filepath.Join(t.TempDir(), "cache.hex")
+	app := cli.New(cli.AppDeps{Store: store})
+	if err := app.Run([]string{"read", "dev1", "-x", "--to", dest}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if string(data) != "01 02\n" {
+		t.Fatalf("file = %q", string(data))
+	}
+}
+
 func TestCheckReadsFromCursorAndAdvances(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -1395,6 +1730,34 @@ func TestCheckReadsFromCursorAndAdvances(t *testing.T) {
 	}
 	if got.CheckOffset != 6 {
 		t.Fatalf("CheckOffset = %d, want 6", got.CheckOffset)
+	}
+}
+
+func TestCheckHexReadsFromCursorAndAdvances(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, CheckOffset: 1}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte{0x00, 0x01, 0x0a, 0xff}, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+	if err := app.Run([]string{"check", "dev1", "-x", "-n", "2"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if out.String() != "01 0a\n" {
+		t.Fatalf("output = %q", out.String())
+	}
+	got, err := store.Load("dev1")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got.CheckOffset != 3 {
+		t.Fatalf("CheckOffset = %d, want 3", got.CheckOffset)
 	}
 }
 
@@ -1458,6 +1821,35 @@ func TestCheckFromWritesToFileAndAdvances(t *testing.T) {
 	}
 	if got.CheckOffset != 6 {
 		t.Fatalf("CheckOffset = %d, want 6", got.CheckOffset)
+	}
+}
+
+func TestClearResetsCacheIndex(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, CheckOffset: 3}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.CachePath("dev1")), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CachePath("dev1"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatalf("WriteFile cache returned error: %v", err)
+	}
+	if err := os.WriteFile(store.CacheIndexPath("dev1"), []byte(`{"at":"2026-05-02T12:00:00+08:00","offset":0,"length":6}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile cache index returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"clear", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	index, err := os.ReadFile(store.CacheIndexPath("dev1"))
+	if err != nil {
+		t.Fatalf("ReadFile cache index returned error: %v", err)
+	}
+	if len(index) != 0 {
+		t.Fatalf("cache index = %q, want empty", string(index))
 	}
 }
 

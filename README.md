@@ -331,8 +331,14 @@ sio send dev1 "\x03"
 sio send dev1 "\cC"
 sio send dev1 "\x1b"
 sio send dev1 "\x04"
+sio send dev1 -x 01 0a 02 0f af
+sio send dev1 -x "AA BB 1C"
+sio send dev1 --file payload.bin
+sio send dev1 --xfile payload.hex
 sio ask dev1 "AT\r\n"
 sio ask dev1 "ATI\r\n" -t 1.5 -l 5
+sio ask dev1 "ATI\r\n" -T
+sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 ```
 
 Payloads support explicit escapes:
@@ -348,10 +354,18 @@ Payloads support explicit escapes:
 Bare forms such as `^C` are ordinary text. This keeps literal payloads
 unambiguous.
 
+For binary protocols, `-x` / `--hex` parses hex bytes directly. Hex input accepts
+whitespace, commas, hyphens, compact bytes, and `0x` prefixes. `--file` sends
+file bytes exactly as stored; it does not parse escapes or append line endings.
+`--xfile` reads a text file containing hex and sends the decoded bytes.
+
 `sio ask` sends one payload, then reads fresh serial response data for a short
 window. The default window is 0.5 seconds and the default output is the last 50
 response lines. Use `-t <seconds>` to change the window and `-l <lines>` to
-print the last N lines. `-l 0` disables the line limit.
+print the last N lines. `-l 0` disables the line limit. With `ask -x`, the
+request is hex and the response is printed as lower-case hex; `-l` is text-only
+and is rejected in hex mode. Use `-T` / `--ts` to show per-line timestamps in
+text mode or per-frame timestamps in hex mode.
 
 ### Reading cached output
 
@@ -360,6 +374,9 @@ sio read dev1 -n 200
 sio read dev1 --to serial-cache.log
 sio read dev1 -n 4096 --to recent.log
 sio check dev1 -n 200
+sio read dev1 -T
+sio read dev1 -x -n 200
+sio check dev1 -x
 sio check dev1 --rewind 2000
 sio check dev1 --from 0 --to checked.log
 sio clear dev1
@@ -374,6 +391,13 @@ saved cursor, or `--from <offset>` to inspect from an absolute cache offset.
 
 Use `--to <file>` for large output so the CLI streams data into a file instead
 of dumping it to the terminal.
+
+Use `-x` / `--hex` with `read` or `check` to format cached bytes as lower-case,
+space-separated hex. When combined with `--to`, the destination file receives
+formatted hex text, not raw cache bytes.
+
+Use `read -T` / `read --ts` to show cached output with the recorded cache chunk
+timestamps. `cache.log` stays raw; timestamp metadata is stored next to it.
 
 ### Live owners
 

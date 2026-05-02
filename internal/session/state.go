@@ -145,6 +145,10 @@ func (s Store) CachePath(name string) string {
 	return filepath.Join(s.SessionDir(name), "cache.log")
 }
 
+func (s Store) CacheIndexPath(name string) string {
+	return filepath.Join(s.SessionDir(name), "cache.index.jsonl")
+}
+
 func (s Store) SessionDir(name string) string {
 	return filepath.Join(s.sessionsRoot(), name)
 }

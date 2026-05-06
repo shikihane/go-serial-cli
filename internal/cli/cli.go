@@ -345,11 +345,12 @@ func (a *App) runPorts(out io.Writer) error {
 
 func (a *App) runOpen(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return a.usage("open <session> <port> [-b baud]")
+		return a.usage("open <session> <port> [-b baud] [--raw]")
 	}
 	name := args[0]
 	port := args[1]
 	baud := 115200
+	rawMode := false
 	if err := session.ValidateName(name); err != nil {
 		return err
 	}
@@ -357,7 +358,7 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 		switch args[i] {
 		case "-b":
 			if i+1 >= len(args) {
-				return a.usage("open <session> <port> [-b baud]")
+				return a.usage("open <session> <port> [-b baud] [--raw]")
 			}
 			parsed, err := strconv.Atoi(args[i+1])
 			if err != nil {
@@ -365,12 +366,14 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 			}
 			baud = parsed
 			i++
+		case "--raw":
+			rawMode = true
 		default:
-			return a.usage("open <session> <port> [-b baud]")
+			return a.usage("open <session> <port> [-b baud] [--raw]")
 		}
 	}
 	if port == "" {
-		return a.usage("open <session> <port> [-b baud]")
+		return a.usage("open <session> <port> [-b baud] [--raw]")
 	}
 	if baud <= 0 {
 		return errors.New("baud rate must be positive")
@@ -383,7 +386,7 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 				return err
 			}
 		}
-		state := session.State{Name: name, Port: port, Baud: baud, Status: session.StatusConfigured}
+		state := session.State{Name: name, Port: port, Baud: baud, Status: session.StatusConfigured, RawMode: rawMode}
 		if a.deps.ReserveControlAddress != nil {
 			controlAddress, err := a.deps.ReserveControlAddress()
 			if err != nil {
@@ -452,7 +455,7 @@ func (a *App) startSessionWorker(name string) error {
 
 func (a *App) runSend(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return a.usage("send <session> [-x] <data...>")
+		return a.usage("send <session> [--raw] [-x] <data...>")
 	}
 	name := args[0]
 	payload, err := parseSendPayload(args[1:])
@@ -467,6 +470,7 @@ func (a *App) runSend(args []string, out io.Writer) error {
 		if state.Paused {
 			return a.pausedSessionError()
 		}
+		payload = payload.withSessionMode(state.RawMode)
 		if address, ok, err := sessionDialAddress(state); err != nil {
 			return err
 		} else if ok && (a.deps.SendSessionPayload != nil || a.deps.SendSession != nil) {
@@ -488,8 +492,10 @@ func (a *App) runSend(args []string, out io.Writer) error {
 }
 
 type cliPayload struct {
-	data []byte
-	text string
+	data         []byte
+	text         string
+	lineEligible bool
+	raw          bool
 }
 
 func parseSendPayload(args []string) (cliPayload, error) {
@@ -497,10 +503,13 @@ func parseSendPayload(args []string) (cliPayload, error) {
 	var rawFile string
 	var hexFile string
 	var tokens []string
+	var raw bool
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-x", "--hex":
 			hexMode = true
+		case "--raw":
+			raw = true
 		case "--file":
 			if i+1 >= len(args) {
 				return cliPayload{}, errors.New("--file requires a path")
@@ -517,7 +526,9 @@ func parseSendPayload(args []string) (cliPayload, error) {
 			tokens = append(tokens, args[i])
 		}
 	}
-	return payloadFromSources(tokens, hexMode, rawFile, hexFile, "send")
+	payload, err := payloadFromSources(tokens, hexMode, rawFile, hexFile, "send")
+	payload.raw = raw
+	return payload, err
 }
 
 func (a *App) sendSerialPayload(port string, baud int, payload cliPayload) error {
@@ -541,9 +552,29 @@ func payloadText(payload cliPayload) string {
 	return string(payload.data)
 }
 
+func (p cliPayload) withSessionMode(rawMode bool) cliPayload {
+	if rawMode || p.raw || !p.lineEligible {
+		return p
+	}
+	if strings.Contains(p.text, `\r`) || strings.Contains(p.text, `\n`) || payloadHasLineEnding(p.data) {
+		return p
+	}
+	p.data = append(append([]byte(nil), p.data...), '\r', '\n')
+	p.text = string(p.data)
+	return p
+}
+
+func payloadHasLineEnding(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	last := data[len(data)-1]
+	return last == '\r' || last == '\n'
+}
+
 func (a *App) runAsk(args []string, out io.Writer) error {
 	if len(args) < 2 {
-		return a.usage("ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]")
+		return a.usage("ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -575,6 +606,7 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 	if state.Paused {
 		return a.pausedSessionError()
 	}
+	payload = payload.withSessionMode(state.RawMode)
 	if address, ok, err := sessionDialAddress(state); err != nil {
 		return err
 	} else if ok {
@@ -616,11 +648,14 @@ func parseAskPayload(args []string) (cliPayload, askFlags, error) {
 	var rawFile string
 	var hexFile string
 	var tokens []string
+	var raw bool
 	lineLimitSet := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-x", "--hex":
 			flags.hexMode = true
+		case "--raw":
+			raw = true
 		case "-T", "--ts":
 			flags.showTimestamps = true
 		case "-t", "--timeout":
@@ -670,6 +705,7 @@ func parseAskPayload(args []string) (cliPayload, askFlags, error) {
 		return cliPayload{}, askFlags{}, errors.New("ask -l is not supported with -x")
 	}
 	payload, err := payloadFromSources(tokens, flags.hexMode, rawFile, hexFile, "ask")
+	payload.raw = raw
 	return payload, flags, err
 }
 
@@ -705,7 +741,7 @@ func payloadFromSources(tokens []string, hexMode bool, rawFile string, hexFile s
 			return cliPayload{}, fmt.Errorf("%s text payload requires exactly one data argument", command)
 		}
 		data, err := serialcmd.ParseTextPayload(tokens[0])
-		return cliPayload{data: data, text: tokens[0]}, err
+		return cliPayload{data: data, text: tokens[0], lineEligible: true}, err
 	}
 }
 
@@ -802,32 +838,39 @@ func (a *App) runShell(args []string, out io.Writer) error {
 	if len(args) != 1 {
 		return a.usage("shell <session>")
 	}
+	name := args[0]
 	input := a.deps.Stdin
 	usingDefaultStdin := input == nil || input == os.Stdin
 	if input == nil {
 		input = os.Stdin
 	}
 	if usingDefaultStdin || a.deps.ShellInterrupts != nil {
+		historyPath := ""
+		if a.deps.Store.Dir != "" {
+			historyPath = a.deps.Store.HistoryPath(name)
+		}
 		var restoreConsole func()
 		if usingDefaultStdin && a.deps.ConfigureShellConsole != nil {
 			restoreConsole = a.deps.ConfigureShellConsole()
 		}
-		wrappedInput, cleanup := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out)
+		wrappedInput, cleanup := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
 		defer cleanup()
 		if restoreConsole != nil {
 			defer restoreConsole()
 		}
 		input = wrappedInput
 	}
-	return a.runStream(args[0], serialcmd.StreamOptions{Input: input}, out)
+	return a.runStream(name, serialcmd.StreamOptions{Input: input}, out)
 }
 
 const shellInterruptExitWindow = 2 * time.Second
 const shellInterruptDuplicateWindow = 50 * time.Millisecond
 
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer) (io.Reader, func()) {
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, func()) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
+	state := newShellInputState(echo, historyPath)
+	state.prompt()
 	var notifyCh chan os.Signal
 	signalCh := interrupts
 	if signalCh == nil {
@@ -836,7 +879,7 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 		signalCh = notifyCh
 	}
 
-	go copyShellInput(writer, input, stop, echo)
+	go copyShellInput(writer, input, stop, state)
 
 	go func() {
 		var lastInterrupt time.Time
@@ -873,13 +916,12 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 	}
 }
 
-func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}, echo io.Writer) {
-	state := &shellInputState{}
+func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}, state *shellInputState) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := input.Read(buf)
 		if n > 0 {
-			if writeErr := state.write(writer, echo, buf[:n]); writeErr != nil {
+			if writeErr := state.write(writer, buf[:n]); writeErr != nil {
 				return
 			}
 		}
@@ -904,11 +946,35 @@ func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}
 }
 
 type shellInputState struct {
-	lastCtrlC time.Time
+	lastCtrlC    time.Time
+	echo         io.Writer
+	historyPath  string
+	history      []string
+	historyIndex int
+	line         []byte
+	esc          []byte
+	prompted     bool
 }
 
-func (s *shellInputState) write(writer *io.PipeWriter, echo io.Writer, data []byte) error {
+func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
+	history := readShellHistory(historyPath)
+	return &shellInputState{
+		echo:         echo,
+		historyPath:  historyPath,
+		history:      history,
+		historyIndex: len(history),
+	}
+}
+
+func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
+	s.prompt()
 	for _, ch := range data {
+		if len(s.esc) > 0 || ch == 0x1b {
+			if err := s.handleEscape(ch); err != nil {
+				return err
+			}
+			continue
+		}
 		if ch == 0x03 {
 			now := time.Now()
 			if !s.lastCtrlC.IsZero() && now.Sub(s.lastCtrlC) <= shellInterruptExitWindow {
@@ -919,19 +985,189 @@ func (s *shellInputState) write(writer *io.PipeWriter, echo io.Writer, data []by
 			}
 			s.lastCtrlC = now
 		}
-		if ch == '\r' {
-			if echo != nil {
-				_, _ = echo.Write([]byte{'\r', '\n'})
+		if ch == '\r' || ch == '\n' {
+			s.newline()
+			s.commitHistory()
+			if _, err := writer.Write(append(append([]byte(nil), s.line...), '\n')); err != nil {
+				return err
 			}
-			ch = '\n'
-		} else if echo != nil && ch != 0x03 {
-			_, _ = echo.Write([]byte{ch})
+			s.line = s.line[:0]
+			s.historyIndex = len(s.history)
+			s.prompted = false
+			s.prompt()
+			continue
 		}
-		if _, err := writer.Write([]byte{ch}); err != nil {
-			return err
+		if ch == '\b' || ch == 0x7f {
+			if len(s.line) > 0 {
+				s.line = s.line[:len(s.line)-1]
+				s.redraw()
+			}
+			continue
 		}
+		if ch == 0x03 {
+			if _, err := writer.Write([]byte{ch}); err != nil {
+				return err
+			}
+			continue
+		}
+		if ch < 0x20 {
+			continue
+		}
+		s.line = append(s.line, ch)
+		s.historyIndex = len(s.history)
+		s.redraw()
 	}
 	return nil
+}
+
+func (s *shellInputState) handleEscape(ch byte) error {
+	s.esc = append(s.esc, ch)
+	if len(s.esc) == 1 {
+		return nil
+	}
+	if len(s.esc) < 3 {
+		return nil
+	}
+	if s.esc[0] == 0x1b && s.esc[1] == '[' {
+		switch s.esc[2] {
+		case 'A':
+			s.historyUp()
+		case 'B':
+			s.historyDown()
+		case 'C':
+			s.acceptSuggestion()
+		}
+	}
+	s.esc = s.esc[:0]
+	return nil
+}
+
+func (s *shellInputState) prompt() {
+	if s.echo == nil || s.prompted {
+		return
+	}
+	_, _ = s.echo.Write([]byte(">> "))
+	s.prompted = true
+}
+
+func (s *shellInputState) newline() {
+	if s.echo != nil {
+		_, _ = s.echo.Write([]byte{'\r', '\n'})
+	}
+}
+
+func (s *shellInputState) redraw() {
+	if s.echo == nil {
+		return
+	}
+	_, _ = s.echo.Write([]byte("\r\x1b[2K>> "))
+	_, _ = s.echo.Write(s.line)
+	if suffix := s.suggestionSuffix(); suffix != "" {
+		_, _ = s.echo.Write([]byte("\x1b[90m"))
+		_, _ = s.echo.Write([]byte(suffix))
+		_, _ = s.echo.Write([]byte("\x1b[0m"))
+	}
+}
+
+func (s *shellInputState) historyUp() {
+	if len(s.history) == 0 {
+		return
+	}
+	if s.historyIndex > 0 {
+		s.historyIndex--
+	}
+	s.line = []byte(s.history[s.historyIndex])
+	s.redraw()
+}
+
+func (s *shellInputState) historyDown() {
+	if len(s.history) == 0 {
+		return
+	}
+	if s.historyIndex < len(s.history)-1 {
+		s.historyIndex++
+		s.line = []byte(s.history[s.historyIndex])
+	} else {
+		s.historyIndex = len(s.history)
+		s.line = s.line[:0]
+	}
+	s.redraw()
+}
+
+func (s *shellInputState) acceptSuggestion() {
+	prefix := string(s.line)
+	if prefix == "" {
+		return
+	}
+	for i := len(s.history) - 1; i >= 0; i-- {
+		item := s.history[i]
+		if item != prefix && strings.HasPrefix(item, prefix) {
+			s.line = []byte(item)
+			s.redraw()
+			return
+		}
+	}
+}
+
+func (s *shellInputState) suggestionSuffix() string {
+	prefix := string(s.line)
+	if prefix == "" {
+		return ""
+	}
+	for i := len(s.history) - 1; i >= 0; i-- {
+		item := s.history[i]
+		if item != prefix && strings.HasPrefix(item, prefix) {
+			return strings.TrimPrefix(item, prefix)
+		}
+	}
+	return ""
+}
+
+func (s *shellInputState) commitHistory() {
+	line := string(s.line)
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	if len(s.history) > 0 && s.history[len(s.history)-1] == line {
+		return
+	}
+	s.history = append(s.history, line)
+	if len(s.history) > 500 {
+		s.history = append([]string(nil), s.history[len(s.history)-500:]...)
+	}
+	if s.historyPath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(s.historyPath), 0o755); err != nil && filepath.Dir(s.historyPath) != "." {
+		return
+	}
+	f, err := os.OpenFile(s.historyPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line + "\n")
+}
+
+func readShellHistory(path string) []string {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	raw := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	history := make([]string, 0, len(raw))
+	for _, line := range raw {
+		if line != "" {
+			history = append(history, line)
+		}
+	}
+	if len(history) > 500 {
+		return append([]string(nil), history[len(history)-500:]...)
+	}
+	return history
 }
 
 func isShellInputInterrupted(err error) bool {
@@ -2181,11 +2417,11 @@ Usage:
   %[1]s version
   %[1]s -v
   %[1]s ports
-  %[1]s open <session> <port> [-b baud]
-  %[1]s send <session> [-x] <data...>
+  %[1]s open <session> <port> [-b baud] [--raw]
+  %[1]s send <session> [--raw] [-x] <data...>
   %[1]s send <session> --file <file>
   %[1]s send <session> --xfile <file>
-  %[1]s ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]
+  %[1]s ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]
   %[1]s read <session> [-x] [-T] [-n count] [--to file]
   %[1]s check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]
   %[1]s clear <session>

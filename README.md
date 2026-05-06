@@ -16,8 +16,8 @@ state and logs, and cleanup that only touches the session you named.
 sio version
 sio ports
 sio open dev1 COM3 -b 115200
-sio send dev1 "AT\r\n"
-sio ask dev1 "AT\r\n"
+sio send dev1 AT
+sio ask dev1 ATI
 sio read dev1 -n 200
 sio check dev1 -n 200
 sio stop dev1
@@ -125,8 +125,8 @@ sio open dev1 COM3 -b 115200
 
 Then different tools can attach in different ways:
 
-- the AI agent reads logs with `sio check dev1` and sends exact bytes with
-  `sio send dev1 "AT\r\n"`.
+- the AI agent reads logs with `sio check dev1` and sends line commands with
+  `sio send dev1 AT`.
 - the human opens `sio shell dev1` when manual judgment is needed.
 - the upper-computer app connects to a virtual COM port created by
   `sio share dev1 COM20 COM21`.
@@ -183,7 +183,7 @@ sequenceDiagram
 
     Dev->>Agent: Ask it to build, flash, and diagnose
     Agent->>sio: sio status dev1
-    Agent->>sio: sio send dev1 "AT\\r\\n"
+    Agent->>sio: sio send dev1 AT
     sio->>DUT: Write bytes to COM3
     DUT-->>sio: Boot logs / command output
     Agent->>sio: sio check dev1 -n 4000
@@ -205,7 +205,7 @@ should still look like a short CLI:
 
 ```bash
 sio open dev1 COM3 -b 115200
-sio send dev1 "AT\r\n"
+sio send dev1 AT
 sio check dev1 -n 200
 sio stop dev1
 ```
@@ -315,6 +315,7 @@ sio version
 sio -v
 sio ports
 sio open dev1 COM3 -b 115200
+sio open rawdev COM4 --raw
 sio list
 sio status dev1
 ```
@@ -326,20 +327,27 @@ named session, never on every session as a side effect.
 ### Sending bytes
 
 ```bash
-sio send dev1 "AT\r\n"
-sio send dev1 "\x03"
-sio send dev1 "\cC"
-sio send dev1 "\x1b"
-sio send dev1 "\x04"
+sio send dev1 AT
+sio send dev1 --raw "\x03"
+sio send dev1 --raw "\cC"
+sio send dev1 --raw "\x1b"
+sio send dev1 --raw "\x04"
 sio send dev1 -x 01 0a 02 0f af
 sio send dev1 -x "AA BB 1C"
 sio send dev1 --file payload.bin
 sio send dev1 --xfile payload.hex
-sio ask dev1 "AT\r\n"
-sio ask dev1 "ATI\r\n" -t 1.5 -l 5
-sio ask dev1 "ATI\r\n" -T
+sio ask dev1 AT
+sio ask dev1 ATI -t 1.5 -l 5
+sio ask dev1 ATI -T
+sio ask dev1 --raw "AT"
 sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 ```
+
+Text `send` and `ask` commands use line mode by default: when the text payload
+does not already contain an explicit `\r` or `\n`, `sio` appends `\r\n`. Open a
+session with `sio open <session> <port> --raw` to make that session default to
+raw text payloads, or add `--raw` to a single `send` or `ask` command. Hex input
+and file input are always raw.
 
 Payloads support explicit escapes:
 
@@ -409,10 +417,12 @@ sio share dev1 COM20 COM21
 ```
 
 `sio shell` connects to the running named session in the foreground, prints serial
-output, and writes stdin to the port. Exiting shell leaves the background worker
-running. Use escaped line endings such as `AT\r\n` when the device expects CRLF.
-On Windows, one Ctrl+C sends byte `0x03` to the device; a second interrupt
-shortly after exits the shell.
+output, and writes submitted lines to the port. It shows an internal `>>` prompt,
+stores per-session command history in `history.log`, supports Up/Down recall,
+and shows the nearest history completion in gray; press Right to accept it.
+Entered lines use the same default CRLF line behavior as `send` and `ask`.
+Exiting shell leaves the background worker running. On Windows, one Ctrl+C sends
+byte `0x03` to the device; a second interrupt shortly after exits the shell.
 
 `sio tee` keeps the port open in the foreground and writes serial output to the
 terminal, the requested file, and the session cache.

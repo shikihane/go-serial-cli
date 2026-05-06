@@ -13,8 +13,8 @@ If `sio` is not installed but `gs` is, use `gs` as the legacy alias.
 
 1. Discover ports: `sio ports`.
 2. Name and start the device worker: `sio open dev1 COM3 -b 115200`.
-3. Send bytes through that worker: `sio send dev1 "AT\r\n"` or `sio send dev1 "\x03"`.
-4. For request/response devices, ask once: `sio ask dev1 "AT\r\n"`; add `-t 1.5 -l 5` when the response needs more time or fewer lines.
+3. Send line commands through that worker: `sio send dev1 AT`; use `sio send dev1 --raw "\x03"` for one raw Ctrl+C byte.
+4. For request/response devices, ask once: `sio ask dev1 ATI`; add `-t 1.5 -l 5` when the response needs more time or fewer lines.
 5. Check liveness before expecting new output: `sio status dev1`.
 6. Read cached output without consuming it: `sio read dev1 -n 200`.
 7. Poll only new cached output: `sio check dev1 -n 200`.
@@ -34,13 +34,15 @@ sio version
 sio -v
 sio ports
 sio open dev1 COM3 -b 115200
-sio send dev1 "AT\r\n"
-sio send dev1 "\x03"
+sio open rawdev COM4 --raw
+sio send dev1 AT
+sio send dev1 --raw "\x03"
 sio send dev1 -x 01 0a 02 0f af
 sio send dev1 --file payload.bin
 sio send dev1 --xfile payload.hex
-sio ask dev1 "AT\r\n"
-sio ask dev1 "ATI\r\n" -t 1.5 -l 5
+sio ask dev1 AT
+sio ask dev1 ATI -t 1.5 -l 5
+sio ask dev1 --raw "AT"
 sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 sio read dev1 -n 200
 sio read dev1 -x -n 200
@@ -66,6 +68,8 @@ sio skill install
 
 ## Payload Escapes
 
+Text `send` and `ask` use line mode by default: if the text payload does not already contain an explicit `\r` or `\n`, `sio` appends `\r\n`. Open a session with `sio open <session> <port> --raw` to make text payloads raw by default for that session, or use `--raw` on a single `send` or `ask`. Hex and file payloads are always raw.
+
 Use explicit byte escapes when sending control characters or line endings. `sio send` and entered `sio shell` lines support:
 
 | Escape | Meaning |
@@ -77,13 +81,13 @@ Use explicit byte escapes when sending control characters or line endings. `sio 
 | `\cX` | ASCII control character `Ctrl+X` |
 
 ```bash
-sio send dev1 "\x03"  # Ctrl+C
-sio send dev1 "\cC"   # Ctrl+C
-sio send dev1 "\x1b"  # ESC
-sio send dev1 "\x04"  # Ctrl+D
+sio send dev1 --raw "\x03"  # Ctrl+C
+sio send dev1 --raw "\cC"   # Ctrl+C
+sio send dev1 --raw "\x1b"  # ESC
+sio send dev1 --raw "\x04"  # Ctrl+D
 ```
 
-Do not treat bare `^C` as special. It is ordinary payload text. In `sio shell`, use escaped line endings such as `AT\r\n` when the device expects CRLF.
+Do not treat bare `^C` as special. It is ordinary payload text. In `sio shell`, entered lines use default CRLF line mode.
 
 Use `-x` / `--hex` for binary protocols:
 
@@ -95,7 +99,7 @@ sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 
 Hex input accepts whitespace, newlines, commas, hyphens, compact bytes, and `0x` prefixes. Empty or invalid hex is an error. Use `--file <path>` to send file bytes exactly as stored, without escape parsing or added line endings. Use `--xfile <path>` to read hex text from a file and send decoded bytes.
 
-`sio ask <session> <data>` sends one payload and immediately reads fresh response data. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. Add `-T` / `--ts` to show timestamps for emitted lines or hex frames. When a session worker is running, `sio ask` sends through that worker and reads only newly cached output after the send.
+`sio ask <session> <data>` sends one payload and immediately reads fresh response data. By default text data is sent with CRLF line ending, it reads for 0.5 seconds, and it prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. Add `-T` / `--ts` to show timestamps for emitted lines or hex frames. When a session worker is running, `sio ask` sends through that worker and reads only newly cached output after the send.
 
 With `sio ask -x`, the request is hex and the response is printed as lower-case, space-separated hex. Do not use `-l` with `ask -x`; line limits are text-only.
 
@@ -134,6 +138,7 @@ Important files:
 state.json
 cache.log
 worker.log
+history.log
 ```
 
 Use `sio log dev1` to print `worker.log` for session and share diagnosis.
@@ -152,7 +157,7 @@ When `worker_state` is `stopped`, nothing is appending serial output in the back
 
 ## Long-Running Modes
 
-Use `sio shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, and writes stdin lines to the port. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
+Use `sio shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, shows an internal `>>` prompt, and writes submitted lines to the port. Shell history is per session in `history.log`; Up/Down recall history, gray completion suggests the most recent matching history entry, and Right accepts the suggestion. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
 
 Use `sio tee dev1 serial.log` when the main goal is recording device output. It writes to terminal, the requested file, and the session cache.
 

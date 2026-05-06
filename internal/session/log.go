@@ -10,6 +10,10 @@ func (s Store) WorkerLogPath(name string) string {
 	return filepath.Join(s.SessionDir(name), "worker.log")
 }
 
+func (s Store) HistoryPath(name string) string {
+	return filepath.Join(s.SessionDir(name), "history.log")
+}
+
 func AppendLog(path string, line string) error {
 	dir := filepath.Dir(path)
 	if dir != "." {

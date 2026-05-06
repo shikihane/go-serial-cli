@@ -62,8 +62,8 @@ func (r *interruptingReader) Read(buf []byte) (int, error) {
 		return 0, r.err
 	}
 	<-r.allowNextRead
-	buf[0] = 'A'
-	return 1, nil
+	copy(buf, []byte("A\r"))
+	return 2, nil
 }
 
 func readOneByte(input io.Reader, buf []byte) <-chan error {
@@ -170,10 +170,11 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"built_at=2026-04-29T06:20:00Z",
 		"sio version",
 		"sio -v",
-		"sio send <session> [-x] <data...>",
+		"sio open <session> <port> [-b baud] [--raw]",
+		"sio send <session> [--raw] [-x] <data...>",
 		"sio send <session> --file <file>",
 		"sio send <session> --xfile <file>",
-		"sio ask <session> [-x] [-T] <data...> [-t seconds] [-l lines]",
+		"sio ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]",
 		"sio read <session> [-x] [-T] [-n count] [--to file]",
 		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
 	} {
@@ -449,12 +450,12 @@ func TestShellKeepsInputOpenWhenStdinReadIsInterrupted(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out allowing next stdin read")
 			}
-			next := make([]byte, 1)
+			next := make([]byte, 2)
 			if _, err := io.ReadFull(opts.Input, next); err != nil {
 				t.Fatalf("input closed after interrupted stdin read: %v", err)
 			}
-			if next[0] != 'A' {
-				t.Fatalf("next input byte = %q, want A", next[0])
+			if string(next) != "A\n" {
+				t.Fatalf("next input bytes = %q, want A newline", string(next))
 			}
 			time.Sleep(100 * time.Millisecond)
 			interrupts <- os.Interrupt
@@ -583,8 +584,8 @@ func TestShellEchoesRawConsoleInput(t *testing.T) {
 	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if got := out.String(); got != "AT\r\n" {
-		t.Fatalf("echo output = %q, want AT CRLF", got)
+	if got := out.String(); !strings.Contains(got, ">> AT\r\n") {
+		t.Fatalf("echo output = %q, want prompt and AT CRLF", got)
 	}
 }
 
@@ -619,6 +620,154 @@ func TestShellNormalizesRawConsoleEnterToLineEnding(t *testing.T) {
 
 	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellPrintsPromptForInteractiveInput(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, ">> ") {
+		t.Fatalf("output = %q, want prompt", got)
+	}
+}
+
+func TestShellSavesCommittedLinesToSessionHistory(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("AT\rATI\r")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			buf := make([]byte, len("AT\nATI\n"))
+			if _, err := io.ReadFull(opts.Input, buf); err != nil {
+				t.Fatalf("input read returned error: %v", err)
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	data, err := os.ReadFile(store.HistoryPath("dev1"))
+	if err != nil {
+		t.Fatalf("ReadFile history returned error: %v", err)
+	}
+	if got := string(data); got != "AT\nATI\n" {
+		t.Fatalf("history = %q, want committed lines", got)
+	}
+}
+
+func TestShellUpAndDownRecallSessionHistory(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.HistoryPath("dev1"), []byte("AT\nATI\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile history returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("\x1b[A\x1b[A\x1b[B\r")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			buf := make([]byte, len("ATI\n"))
+			if _, err := io.ReadFull(opts.Input, buf); err != nil {
+				t.Fatalf("input read returned error: %v", err)
+			}
+			if string(buf) != "ATI\n" {
+				t.Fatalf("input = %q, want ATI newline", string(buf))
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellRightAcceptsHistorySuggestion(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.HistoryPath("dev1"), []byte("ATI\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile history returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("AT\x1b[C\r")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			buf := make([]byte, len("ATI\n"))
+			if _, err := io.ReadFull(opts.Input, buf); err != nil {
+				t.Fatalf("input read returned error: %v", err)
+			}
+			if string(buf) != "ATI\n" {
+				t.Fatalf("input = %q, want accepted suggestion", string(buf))
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "\x1b[90mI\x1b[0m") {
+		t.Fatalf("output = %q, want gray suggestion suffix", got)
 	}
 }
 
@@ -839,6 +988,32 @@ func TestOpenStoresNamedSession(t *testing.T) {
 	if got.Name != "dev1" || got.Port != "COM3" || got.Baud != 115200 {
 		t.Fatalf("state = %#v", got)
 	}
+	if got.RawMode {
+		t.Fatalf("RawMode = true, want false by default")
+	}
+}
+
+func TestOpenRawStoresRawMode(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		StartWorker: func(name string) (int, error) {
+			return 4242, nil
+		},
+	})
+
+	if err := app.Run([]string{"open", "dev1", "COM3", "--raw"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got, err := store.Load("dev1")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !got.RawMode {
+		t.Fatalf("RawMode = false, want true")
+	}
 }
 
 func TestOpenStartsSessionWorkerAndRecordsControlAddress(t *testing.T) {
@@ -1033,10 +1208,76 @@ func TestSendUsesNamedSession(t *testing.T) {
 	called := false
 	app := cli.New(cli.AppDeps{
 		Store: store,
-		SendSerial: func(port string, baud int, data string) error {
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
 			called = true
-			if port != "COM3" || baud != 115200 || data != "AT\\r\\n" {
-				t.Fatalf("send args = %q %d %q", port, baud, data)
+			if port != "COM3" || baud != 115200 || !bytes.Equal(payload, []byte("AT\r\n")) {
+				t.Fatalf("send args = %q %d %q", port, baud, string(payload))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"send", "dev1", "AT"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("SendSerial was not called")
+	}
+}
+
+func TestSendRawDoesNotAppendLineEnding(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, []byte("AT")) {
+				t.Fatalf("payload = %q, want raw AT", string(payload))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"send", "dev1", "--raw", "AT"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendRawSessionDoesNotAppendLineEnding(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, RawMode: true}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, []byte("AT")) {
+				t.Fatalf("payload = %q, want raw AT", string(payload))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"send", "dev1", "AT"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestSendDoesNotDoubleAppendExplicitLineEnding(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		SendSerialPayload: func(port string, baud int, payload []byte) error {
+			if !bytes.Equal(payload, []byte("AT\r\n")) {
+				t.Fatalf("payload = %q, want explicit AT CRLF only", string(payload))
 			}
 			return nil
 		},
@@ -1044,9 +1285,6 @@ func TestSendUsesNamedSession(t *testing.T) {
 
 	if err := app.Run([]string{"send", "dev1", "AT\\r\\n"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
-	}
-	if !called {
-		t.Fatal("SendSerial was not called")
 	}
 }
 
@@ -1298,7 +1536,7 @@ func TestAskUsesNamedSessionWithDefaults(t *testing.T) {
 		Store: store,
 		AskSerial: func(opts serialcmd.AskOptions) error {
 			called = true
-			if opts.Port != "COM3" || opts.Baud != 115200 || opts.Data != "AT\\r\\n" {
+			if opts.Port != "COM3" || opts.Baud != 115200 || !bytes.Equal(opts.Payload, []byte("AT\r\n")) {
 				t.Fatalf("ask opts = %#v", opts)
 			}
 			if opts.Timeout != 500*time.Millisecond {
@@ -1317,11 +1555,33 @@ func TestAskUsesNamedSessionWithDefaults(t *testing.T) {
 		},
 	})
 
-	if err := app.Run([]string{"ask", "dev1", "AT\\r\\n"}, &out); err != nil {
+	if err := app.Run([]string{"ask", "dev1", "AT"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if !called {
 		t.Fatal("AskSerial was not called")
+	}
+}
+
+func TestAskRawDoesNotAppendLineEnding(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		AskSerial: func(opts serialcmd.AskOptions) error {
+			if !bytes.Equal(opts.Payload, []byte("AT")) {
+				t.Fatalf("payload = %q, want raw AT", string(opts.Payload))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"ask", "dev1", "--raw", "AT"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }
 

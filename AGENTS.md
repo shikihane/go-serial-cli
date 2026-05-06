@@ -13,11 +13,12 @@ sio version
 sio -v
 sio ports
 sio open dev1 COM3 -b 115200
+sio open rawdev COM4 --raw
+sio send dev1 AT
+sio send dev1 --raw "\x03"
+sio ask dev1 ATI
+sio ask dev1 ATI -t 1.5 -l 5
 sio share dev1 COM20 COM21
-sio send dev1 "AT\r\n"
-sio send dev1 "\x03"
-sio ask dev1 "AT\r\n"
-sio ask dev1 "ATI\r\n" -t 1.5 -l 5
 sio read dev1 -n 200
 sio read dev1 --to serial-cache.log
 sio check dev1 -n 200
@@ -78,19 +79,19 @@ Use `go.bug.st/serial` for serial behavior. Do not shell out to PowerShell for c
 
 ## Current Behavior
 
-`sio open <session> <port>` stores a named serial session in the user config directory, starts a background session worker, and keeps the physical port open until `sio stop <session>` or `sio rm <session>`.
+`sio open <session> <port>` stores a named serial session in the user config directory, starts a background session worker, and keeps the physical port open until `sio stop <session>` or `sio rm <session>`. Text `send` and `ask` use line mode by default for normal command devices. Use `sio open <session> <port> --raw` when that session should send raw text payloads by default.
 
 `sio ports` enumerates ports through `go.bug.st/serial`.
 
-`sio send <session>` writes one payload through the named session worker when it is running. If no worker/control channel is available, it may open the named session port for that one write and close it. Payloads support explicit escapes: `\r`, `\n`, `\t`, `\xNN` for one hexadecimal byte, and `\cX` for ASCII control characters. For example, `sio send dev1 "\x03"` and `sio send dev1 "\cC"` both send Ctrl+C, `sio send dev1 "\x1b"` sends ESC, and `sio send dev1 "\x04"` sends Ctrl+D. Do not treat bare `^C` as special; it should remain ordinary payload text.
+`sio send <session>` writes one payload through the named session worker when it is running. If no worker/control channel is available, it may open the named session port for that one write and close it. Text payloads append `\r\n` by default unless the text already contains an explicit `\r` or `\n`; use `sio send <session> --raw <data>` for a one-shot raw text payload. Payloads support explicit escapes: `\r`, `\n`, `\t`, `\xNN` for one hexadecimal byte, and `\cX` for ASCII control characters. For example, `sio send dev1 --raw "\x03"` and `sio send dev1 --raw "\cC"` both send Ctrl+C, `sio send dev1 --raw "\x1b"` sends ESC, and `sio send dev1 --raw "\x04"` sends Ctrl+D. Do not treat bare `^C` as special; it should remain ordinary payload text. Hex and file payloads are always raw.
 
-`sio ask <session> <data>` sends one payload and immediately reads fresh response data for request/response devices. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. When a session worker is running, `sio ask` sends through that worker and reads only newly appended cache output after the send. Without a worker/control channel, it may open the named session port for the ask and append the response to the local cache.
+`sio ask <session> <data>` sends one payload and immediately reads fresh response data for request/response devices. Text payloads use the same default CRLF line mode as `send`; use `--raw` for a one-shot raw text request. By default it reads for 0.5 seconds and prints the last 50 response lines. Use `-t <seconds>` to change the response window, `-l <lines>` to print the last N lines, and `-l 0` to disable the line limit. When a session worker is running, `sio ask` sends through that worker and reads only newly appended cache output after the send. Without a worker/control channel, it may open the named session port for the ask and append the response to the local cache.
 
 `sio read <session>` reads from that session's local cache file without consuming, truncating, or advancing any cursor. Background workers and `tee` append serial output to that cache when they own a readable serial stream. Large cache reads should use `sio read <session> --to <file>` so data is streamed into a file instead of dumped to the terminal; `-n` may be combined with `--to` to export only the last N bytes.
 
 `sio check <session>` is the incremental-read command. It reads from the saved check cursor and advances that cursor only to the bytes it emitted. Use `sio check <session> --rewind <bytes>` to back up if important output was missed, or `sio check <session> --from <offset>` to inspect from an absolute cache offset. `sio clear <session>` resets both cache contents and the check cursor.
 
-`sio shell <session>` connects to the named session worker in the foreground when it is running. It continuously prints serial output and writes stdin lines to the port. Exiting shell must leave the background session worker running. Use escaped line endings such as `AT\r\n` when the device expects CRLF; the same payload escapes as `sio send` apply to entered lines.
+`sio shell <session>` connects to the named session worker in the foreground when it is running. It continuously prints serial output, shows an internal `>>` input prompt, and writes submitted lines to the port. Exiting shell must leave the background session worker running. Entered lines use the same default CRLF line mode as `sio send`. Shell history is per session in `history.log`; Up/Down recall history, gray completion suggests the most recent matching entry, and Right accepts the suggestion.
 
 `sio tee <session> <file>` opens the named session port and keeps it open in the foreground. It continuously writes serial output to both the screen and the file, and also appends output to the local cache file used by `sio read <session>`.
 

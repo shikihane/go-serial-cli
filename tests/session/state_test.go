@@ -13,7 +13,7 @@ import (
 
 func TestStoreSavesAndLoadsState(t *testing.T) {
 	store := session.Store{Dir: t.TempDir()}
-	state := session.State{Name: "dev1", Port: "COM3", Baud: 115200, Status: session.StatusConfigured, Paused: true}
+	state := session.State{Name: "dev1", Port: "COM3", Baud: 115200, Status: session.StatusConfigured, Paused: true, RawMode: true}
 
 	if err := store.Save(state); err != nil {
 		t.Fatalf("Save returned error: %v", err)
@@ -181,5 +181,16 @@ func TestStoreUsesPerSessionWorkerLogPath(t *testing.T) {
 	}
 	if filepath.Dir(store.WorkerLogPath("dev1")) != store.SessionDir("dev1") {
 		t.Fatalf("WorkerLogPath dir = %q, want %q", filepath.Dir(store.WorkerLogPath("dev1")), store.SessionDir("dev1"))
+	}
+}
+
+func TestStoreUsesPerSessionHistoryPath(t *testing.T) {
+	store := session.Store{Dir: t.TempDir()}
+
+	if got := store.HistoryPath("dev1"); filepath.Base(got) != "history.log" {
+		t.Fatalf("HistoryPath base = %q, want history.log", filepath.Base(got))
+	}
+	if filepath.Dir(store.HistoryPath("dev1")) != store.SessionDir("dev1") {
+		t.Fatalf("HistoryPath dir = %q, want %q", filepath.Dir(store.HistoryPath("dev1")), store.SessionDir("dev1"))
 	}
 }

@@ -27,6 +27,7 @@ type State struct {
 	HubPorts       []string `json:"hub_ports,omitempty"`
 	TCPAddress     string   `json:"tcp_address,omitempty"`
 	ControlAddress string   `json:"control_address,omitempty"`
+	RawMode        bool     `json:"raw_mode,omitempty"`
 	CheckOffset    int64    `json:"check_offset,omitempty"`
 	WorkerPID      int      `json:"worker_pid,omitempty"`
 	HubPID         int      `json:"hub_pid,omitempty"`

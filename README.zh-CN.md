@@ -12,8 +12,8 @@
 sio version
 sio ports
 sio open dev1 COM3 -b 115200
-sio send dev1 "AT\r\n"
-sio ask dev1 "AT\r\n"
+sio send dev1 AT
+sio ask dev1 ATI
 sio read dev1 -n 200
 sio check dev1 -n 200
 sio stop dev1
@@ -90,7 +90,7 @@ sio open dev1 COM3 -b 115200
 
 之后，不同工具可以用不同方式接入：
 
-- AI 代理用 `sio check dev1` 读取日志，用 `sio send dev1 "AT\r\n"` 发送精确字节。
+- AI 代理用 `sio check dev1` 读取日志，用 `sio send dev1 AT` 发送行命令。
 - 人在需要判断时打开 `sio shell dev1`。
 - 上位机程序连接到 `sio share dev1 COM20 COM21` 创建的虚拟 COM 端口。
 - 远程同事或机器通过 `sio tcp dev1 :7001` 连接。
@@ -140,7 +140,7 @@ sequenceDiagram
 
     Dev->>Agent: 要求构建、烧录和诊断
     Agent->>GS: sio status dev1
-    Agent->>GS: sio send dev1 "AT\\r\\n"
+    Agent->>GS: sio send dev1 AT
     GS->>DUT: 向 COM3 写入字节
     DUT-->>GS: 启动日志 / 命令输出
     Agent->>GS: sio check dev1 -n 4000
@@ -159,7 +159,7 @@ sequenceDiagram
 
 ```bash
 sio open dev1 COM3 -b 115200
-sio send dev1 "AT\r\n"
+sio send dev1 AT
 sio check dev1 -n 200
 sio stop dev1
 ```
@@ -264,6 +264,7 @@ sio version
 sio -v
 sio ports
 sio open dev1 COM3 -b 115200
+sio open rawdev COM4 --raw
 sio list
 sio status dev1
 ```
@@ -273,20 +274,26 @@ sio status dev1
 ### 发送字节
 
 ```bash
-sio send dev1 "AT\r\n"
-sio send dev1 "\x03"
-sio send dev1 "\cC"
-sio send dev1 "\x1b"
-sio send dev1 "\x04"
+sio send dev1 AT
+sio send dev1 --raw "\x03"
+sio send dev1 --raw "\cC"
+sio send dev1 --raw "\x1b"
+sio send dev1 --raw "\x04"
 sio send dev1 -x 01 0a 02 0f af
 sio send dev1 -x "AA BB 1C"
 sio send dev1 --file payload.bin
 sio send dev1 --xfile payload.hex
-sio ask dev1 "AT\r\n"
-sio ask dev1 "ATI\r\n" -t 1.5 -l 5
-sio ask dev1 "ATI\r\n" -T
+sio ask dev1 AT
+sio ask dev1 ATI -t 1.5 -l 5
+sio ask dev1 ATI -T
+sio ask dev1 --raw "AT"
 sio ask dev1 -x -t 1 01 03 00 00 00 02 c4 0b
 ```
+
+文本 `send` 和 `ask` 默认使用行模式：当文本 payload 中没有显式 `\r` 或 `\n`
+时，`sio` 会自动追加 `\r\n`。如果某个会话默认要发送原始文本 payload，可以用
+`sio open <session> <port> --raw` 打开；如果只是单次原始发送，在 `send` 或
+`ask` 上加 `--raw`。十六进制输入和文件输入始终是 raw，不会追加行尾。
 
 payload 支持显式转义：
 
@@ -340,7 +347,7 @@ sio tcp dev1 :7001
 sio share dev1 COM20 COM21
 ```
 
-`sio shell` 在前台保持命名会话打开，打印串口输出，并把 stdin 写入串口。设备需要 CRLF 时，请输入 `AT\r\n` 这样的转义行尾。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
+`sio shell` 在前台保持命名会话打开，打印串口输出，并把提交的输入行写入串口。它会显示内部 `>>` 提示符，把每个 session 的命令历史保存到 `history.log`，支持上/下方向键召回历史，并用灰色显示最近的历史补全；按右方向键接受补全。输入行使用和 `send`、`ask` 相同的默认 CRLF 行模式。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
 
 `sio tee` 在前台保持端口打开，并把串口输出写到终端、指定文件和会话缓存。
 

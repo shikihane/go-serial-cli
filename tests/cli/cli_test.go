@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,23 @@ import (
 	"go-serial-cli/internal/serialcmd"
 	"go-serial-cli/internal/session"
 )
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func wantPairs(t *testing.T, got []cli.VirtualPortPair, want []cli.VirtualPortPair) {
 	t.Helper()
@@ -768,6 +786,49 @@ func TestShellRightAcceptsHistorySuggestion(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, "\x1b[90mI\x1b[0m") {
 		t.Fatalf("output = %q, want gray suggestion suffix", got)
+	}
+}
+
+func TestShellRedrawsPromptAfterStreamOutput(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("fs")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> fs") {
+				select {
+				case <-deadline:
+					t.Fatalf("timed out waiting for current input echo; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if _, err := opts.Output.Write([]byte("SD:/\r\n")); err != nil {
+				t.Fatalf("output Write returned error: %v", err)
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "\r\x1b[2KSD:/\r\n\r\x1b[2K>> fs") {
+		t.Fatalf("output = %q, want stream output followed by redrawn prompt and current input", got)
 	}
 }
 

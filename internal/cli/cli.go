@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -853,12 +854,16 @@ func (a *App) runShell(args []string, out io.Writer) error {
 		if usingDefaultStdin && a.deps.ConfigureShellConsole != nil {
 			restoreConsole = a.deps.ConfigureShellConsole()
 		}
-		wrappedInput, cleanup := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
+		if usingDefaultStdin {
+			input = shellConsoleInput(input)
+		}
+		wrappedInput, wrappedOutput, cleanup := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
 		defer cleanup()
 		if restoreConsole != nil {
 			defer restoreConsole()
 		}
 		input = wrappedInput
+		out = wrappedOutput
 	}
 	return a.runStream(name, serialcmd.StreamOptions{Input: input}, out)
 }
@@ -866,7 +871,7 @@ func (a *App) runShell(args []string, out io.Writer) error {
 const shellInterruptExitWindow = 2 * time.Second
 const shellInterruptDuplicateWindow = 50 * time.Millisecond
 
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, func()) {
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, io.Writer, func()) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
 	state := newShellInputState(echo, historyPath)
@@ -907,7 +912,7 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 		}
 	}()
 
-	return reader, func() {
+	return reader, shellOutputWriter{state: state}, func() {
 		close(stop)
 		if notifyCh != nil {
 			signal.Stop(notifyCh)
@@ -946,6 +951,7 @@ func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}
 }
 
 type shellInputState struct {
+	mu           sync.Mutex
 	lastCtrlC    time.Time
 	echo         io.Writer
 	historyPath  string
@@ -954,6 +960,17 @@ type shellInputState struct {
 	line         []byte
 	esc          []byte
 	prompted     bool
+}
+
+type shellOutputWriter struct {
+	state *shellInputState
+}
+
+func (w shellOutputWriter) Write(data []byte) (int, error) {
+	if w.state == nil {
+		return len(data), nil
+	}
+	return w.state.writeOutput(data)
 }
 
 func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
@@ -967,10 +984,13 @@ func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
 }
 
 func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
+	s.mu.Lock()
 	s.prompt()
+	var writes [][]byte
 	for _, ch := range data {
 		if len(s.esc) > 0 || ch == 0x1b {
 			if err := s.handleEscape(ch); err != nil {
+				s.mu.Unlock()
 				return err
 			}
 			continue
@@ -981,6 +1001,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 				if now.Sub(s.lastCtrlC) <= shellInterruptDuplicateWindow {
 					continue
 				}
+				s.mu.Unlock()
 				return writer.Close()
 			}
 			s.lastCtrlC = now
@@ -988,9 +1009,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		if ch == '\r' || ch == '\n' {
 			s.newline()
 			s.commitHistory()
-			if _, err := writer.Write(append(append([]byte(nil), s.line...), '\n')); err != nil {
-				return err
-			}
+			writes = append(writes, append(append([]byte(nil), s.line...), '\n'))
 			s.line = s.line[:0]
 			s.historyIndex = len(s.history)
 			s.prompted = false
@@ -1005,9 +1024,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			continue
 		}
 		if ch == 0x03 {
-			if _, err := writer.Write([]byte{ch}); err != nil {
-				return err
-			}
+			writes = append(writes, []byte{ch})
 			continue
 		}
 		if ch < 0x20 {
@@ -1017,7 +1034,44 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		s.historyIndex = len(s.history)
 		s.redraw()
 	}
+	s.mu.Unlock()
+	for _, payload := range writes {
+		if _, err := writer.Write(payload); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *shellInputState) writeOutput(data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.echo == nil {
+		return len(data), nil
+	}
+	if s.prompted {
+		if _, err := s.echo.Write([]byte("\r\x1b[2K")); err != nil {
+			return 0, err
+		}
+	}
+	if len(data) > 0 {
+		n, err := s.echo.Write(data)
+		if err != nil {
+			return n, err
+		}
+		if n != len(data) {
+			return n, io.ErrShortWrite
+		}
+	}
+	if s.prompted {
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			if _, err := s.echo.Write([]byte{'\r', '\n'}); err != nil {
+				return len(data), err
+			}
+		}
+		s.redraw()
+	}
+	return len(data), nil
 }
 
 func (s *shellInputState) handleEscape(ch byte) error {

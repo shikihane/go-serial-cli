@@ -61,6 +61,7 @@ func TestShellConsoleKeyBytesMapsArrowKeysToEscapeSequences(t *testing.T) {
 		{"up", vkUp, "\x1b[A"},
 		{"down", vkDown, "\x1b[B"},
 		{"right", vkRight, "\x1b[C"},
+		{"left", vkLeft, "\x1b[D"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

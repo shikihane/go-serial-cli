@@ -832,6 +832,174 @@ func TestShellRedrawsPromptAfterStreamOutput(t *testing.T) {
 	}
 }
 
+func TestShellMergesBurstOutputBeforePromptRedraw(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("fs")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> fs") {
+				select {
+				case <-deadline:
+					t.Fatalf("timed out waiting for current input echo; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			// One continuous print delivered as several driver reads.
+			for _, chunk := range []string{"abc", "def", "ghi\r\n"} {
+				if _, err := opts.Output.Write([]byte(chunk)); err != nil {
+					t.Fatalf("output Write returned error: %v", err)
+				}
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "\r\x1b[2Kabcdefghi\r\n\r\x1b[2K>> fs") {
+		t.Fatalf("output = %q, want burst chunks merged into one line before prompt redraw", got)
+	}
+}
+
+func TestShellRedrawsPromptAfterPartialOutputIdle(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("fs")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> fs") {
+				select {
+				case <-deadline:
+					t.Fatalf("timed out waiting for current input echo; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if _, err := opts.Output.Write([]byte("SD:/")); err != nil {
+				t.Fatalf("output Write returned error: %v", err)
+			}
+			deadline = time.After(2 * time.Second)
+			for !strings.Contains(out.String(), "SD:/\r\n\r\x1b[2K>> fs") {
+				select {
+				case <-deadline:
+					t.Fatalf("timed out waiting for idle prompt redraw; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellEditsLineWithLeftAndRightArrows(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			// Type "fs", move left once, insert "i", move right once,
+			// insert "h": final line should be "fish".
+			if _, err := stdinWriter.Write([]byte("fs\x1b[Di\x1b[Ch\r")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			buf := make([]byte, len("fish\n"))
+			if _, err := io.ReadFull(opts.Input, buf); err != nil {
+				t.Fatalf("input read returned error: %v", err)
+			}
+			if string(buf) != "fish\n" {
+				t.Fatalf("input = %q, want edited line %q", string(buf), "fish\n")
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "\x1b[1D") {
+		t.Fatalf("output = %q, want cursor-left escape emitted for left arrow", got)
+	}
+}
+
+func TestShellBackspaceDeletesAtCursor(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			// Type "fsx", left once, backspace removes "s": final "fx".
+			if _, err := stdinWriter.Write([]byte("fsx\x1b[D\x7f\r")); err != nil {
+				t.Fatalf("stdin Write returned error: %v", err)
+			}
+			buf := make([]byte, len("fx\n"))
+			if _, err := io.ReadFull(opts.Input, buf); err != nil {
+				t.Fatalf("input read returned error: %v", err)
+			}
+			if string(buf) != "fx\n" {
+				t.Fatalf("input = %q, want %q", string(buf), "fx\n")
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
 func TestShellWrapsDefaultOSStdinForInterruptHandling(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}

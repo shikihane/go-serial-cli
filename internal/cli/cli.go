@@ -871,6 +871,13 @@ func (a *App) runShell(args []string, out io.Writer) error {
 const shellInterruptExitWindow = 2 * time.Second
 const shellInterruptDuplicateWindow = 50 * time.Millisecond
 
+// shellPromptRedrawDelay is the idle window used to debounce the forced
+// newline and prompt redraw after serial output that does not end with a
+// line break. Serial drivers often deliver one continuous print as several
+// small reads; only a pause longer than this window is treated as the end
+// of the burst.
+const shellPromptRedrawDelay = 100 * time.Millisecond
+
 func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, io.Writer, func()) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
@@ -913,6 +920,7 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 	}()
 
 	return reader, shellOutputWriter{state: state}, func() {
+		state.stopRedrawTimer()
 		close(stop)
 		if notifyCh != nil {
 			signal.Stop(notifyCh)
@@ -951,15 +959,20 @@ func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}
 }
 
 type shellInputState struct {
-	mu           sync.Mutex
-	lastCtrlC    time.Time
-	echo         io.Writer
-	historyPath  string
-	history      []string
-	historyIndex int
-	line         []byte
-	esc          []byte
-	prompted     bool
+	mu             sync.Mutex
+	lastCtrlC      time.Time
+	echo           io.Writer
+	historyPath    string
+	history        []string
+	historyIndex   int
+	line           []byte
+	cursor         int
+	esc            []byte
+	prompted       bool
+	promptVisible  bool
+	partialPending bool
+	redrawGen      uint64
+	redrawTimer    *time.Timer
 }
 
 type shellOutputWriter struct {
@@ -985,6 +998,7 @@ func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
 
 func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	s.mu.Lock()
+	s.flushPartialPendingLocked()
 	s.prompt()
 	var writes [][]byte
 	for _, ch := range data {
@@ -1011,14 +1025,16 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			s.commitHistory()
 			writes = append(writes, append(append([]byte(nil), s.line...), '\n'))
 			s.line = s.line[:0]
+			s.cursor = 0
 			s.historyIndex = len(s.history)
 			s.prompted = false
 			s.prompt()
 			continue
 		}
 		if ch == '\b' || ch == 0x7f {
-			if len(s.line) > 0 {
-				s.line = s.line[:len(s.line)-1]
+			if s.cursor > 0 {
+				s.line = append(s.line[:s.cursor-1], s.line[s.cursor:]...)
+				s.cursor--
 				s.redraw()
 			}
 			continue
@@ -1030,7 +1046,10 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		if ch < 0x20 {
 			continue
 		}
-		s.line = append(s.line, ch)
+		s.line = append(s.line, 0)
+		copy(s.line[s.cursor+1:], s.line[s.cursor:])
+		s.line[s.cursor] = ch
+		s.cursor++
 		s.historyIndex = len(s.history)
 		s.redraw()
 	}
@@ -1049,10 +1068,14 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 	if s.echo == nil {
 		return len(data), nil
 	}
-	if s.prompted {
+	// Only erase the line when the prompt is the last thing on it. After
+	// partial serial output the line ends with device data; erasing then
+	// would delete that data.
+	if s.promptVisible {
 		if _, err := s.echo.Write([]byte("\r\x1b[2K")); err != nil {
 			return 0, err
 		}
+		s.promptVisible = false
 	}
 	if len(data) > 0 {
 		n, err := s.echo.Write(data)
@@ -1065,13 +1088,75 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 	}
 	if s.prompted {
 		if len(data) > 0 && data[len(data)-1] != '\n' {
-			if _, err := s.echo.Write([]byte{'\r', '\n'}); err != nil {
-				return len(data), err
-			}
+			s.partialPending = true
+			s.schedulePromptRedrawLocked()
+		} else {
+			// The data completed the line itself; just cancel any
+			// deferred break from an earlier partial chunk.
+			s.cancelPartialPendingLocked()
+			s.redraw()
 		}
-		s.redraw()
 	}
 	return len(data), nil
+}
+
+// cancelPartialPendingLocked drops the deferred line break without
+// emitting it. Callers must hold s.mu.
+func (s *shellInputState) cancelPartialPendingLocked() {
+	s.redrawGen++
+	if s.redrawTimer != nil {
+		s.redrawTimer.Stop()
+		s.redrawTimer = nil
+	}
+	s.partialPending = false
+}
+
+// flushPartialPendingLocked emits the deferred line break for partial
+// output. Callers must hold s.mu.
+func (s *shellInputState) flushPartialPendingLocked() {
+	pending := s.partialPending
+	s.cancelPartialPendingLocked()
+	if pending && s.echo != nil {
+		_, _ = s.echo.Write([]byte{'\r', '\n'})
+	}
+}
+
+// schedulePromptRedrawLocked defers the prompt redraw until the serial
+// output has been idle for shellPromptRedrawDelay, so one continuous print
+// delivered as several driver reads is not split into multiple lines.
+// Callers must hold s.mu.
+func (s *shellInputState) schedulePromptRedrawLocked() {
+	s.redrawGen++
+	gen := s.redrawGen
+	if s.redrawTimer != nil {
+		s.redrawTimer.Stop()
+	}
+	s.redrawTimer = time.AfterFunc(shellPromptRedrawDelay, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if gen != s.redrawGen || !s.partialPending {
+			return
+		}
+		s.partialPending = false
+		s.redrawTimer = nil
+		if s.echo != nil && s.prompted {
+			_, _ = s.echo.Write([]byte{'\r', '\n'})
+			s.redraw()
+		}
+	})
+}
+
+// stopRedrawTimer cancels any pending debounced redraw. Called during
+// shell cleanup so the timer cannot fire after the shell exits.
+func (s *shellInputState) stopRedrawTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.redrawGen++
+	s.partialPending = false
+	if s.redrawTimer != nil {
+		s.redrawTimer.Stop()
+		s.redrawTimer = nil
+	}
 }
 
 func (s *shellInputState) handleEscape(ch byte) error {
@@ -1089,7 +1174,13 @@ func (s *shellInputState) handleEscape(ch byte) error {
 		case 'B':
 			s.historyDown()
 		case 'C':
-			s.acceptSuggestion()
+			if s.cursor < len(s.line) {
+				s.moveCursorRight()
+			} else {
+				s.acceptSuggestion()
+			}
+		case 'D':
+			s.moveCursorLeft()
 		}
 	}
 	s.esc = s.esc[:0]
@@ -1102,6 +1193,7 @@ func (s *shellInputState) prompt() {
 	}
 	_, _ = s.echo.Write([]byte(">> "))
 	s.prompted = true
+	s.promptVisible = true
 }
 
 func (s *shellInputState) newline() {
@@ -1116,10 +1208,35 @@ func (s *shellInputState) redraw() {
 	}
 	_, _ = s.echo.Write([]byte("\r\x1b[2K>> "))
 	_, _ = s.echo.Write(s.line)
-	if suffix := s.suggestionSuffix(); suffix != "" {
+	suffix := s.suggestionSuffix()
+	if suffix != "" {
 		_, _ = s.echo.Write([]byte("\x1b[90m"))
 		_, _ = s.echo.Write([]byte(suffix))
 		_, _ = s.echo.Write([]byte("\x1b[0m"))
+	}
+	if back := len(s.line) - s.cursor + len(suffix); back > 0 {
+		_, _ = fmt.Fprintf(s.echo, "\x1b[%dD", back)
+	}
+	s.promptVisible = true
+}
+
+func (s *shellInputState) moveCursorLeft() {
+	if s.cursor == 0 {
+		return
+	}
+	s.cursor--
+	if s.echo != nil {
+		_, _ = s.echo.Write([]byte("\x1b[1D"))
+	}
+}
+
+func (s *shellInputState) moveCursorRight() {
+	if s.cursor >= len(s.line) {
+		return
+	}
+	s.cursor++
+	if s.echo != nil {
+		_, _ = s.echo.Write([]byte("\x1b[1C"))
 	}
 }
 
@@ -1131,6 +1248,7 @@ func (s *shellInputState) historyUp() {
 		s.historyIndex--
 	}
 	s.line = []byte(s.history[s.historyIndex])
+	s.cursor = len(s.line)
 	s.redraw()
 }
 
@@ -1145,6 +1263,7 @@ func (s *shellInputState) historyDown() {
 		s.historyIndex = len(s.history)
 		s.line = s.line[:0]
 	}
+	s.cursor = len(s.line)
 	s.redraw()
 }
 
@@ -1157,6 +1276,7 @@ func (s *shellInputState) acceptSuggestion() {
 		item := s.history[i]
 		if item != prefix && strings.HasPrefix(item, prefix) {
 			s.line = []byte(item)
+			s.cursor = len(s.line)
 			s.redraw()
 			return
 		}

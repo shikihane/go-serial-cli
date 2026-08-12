@@ -157,7 +157,7 @@ When `worker_state` is `stopped`, nothing is appending serial output in the back
 
 ## Long-Running Modes
 
-Use `sio shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, shows an internal `>>` prompt, and writes submitted lines to the port. Shell history is per session in `history.log`; Up/Down recall history, gray completion suggests the most recent matching history entry, and Right accepts the suggestion. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
+Use `sio shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, shows an internal `>>` prompt, and writes submitted lines to the port. Shell history is per session in `history.log`; Up/Down recall history, Left/Right move the cursor for in-line editing, gray completion suggests the most recent matching history entry, and Right at end of line accepts the suggestion. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
 
 Use `sio tee dev1 serial.log` when the main goal is recording device output. It writes to terminal, the requested file, and the session cache.
 

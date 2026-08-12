@@ -113,7 +113,7 @@ func shellConsoleKeyBytes(event keyEventRecord) []byte {
 	case vkRight:
 		return []byte{0x1b, '[', 'C'}
 	case vkLeft:
-		return nil
+		return []byte{0x1b, '[', 'D'}
 	}
 	if event.UnicodeChar == 0 {
 		return nil

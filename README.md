@@ -407,6 +407,49 @@ formatted hex text, not raw cache bytes.
 Use `read -T` / `read --ts` to show cached output with the recorded cache chunk
 timestamps. `cache.log` stays raw; timestamp metadata is stored next to it.
 
+### Monitoring both directions (TX + RX)
+
+```bash
+sio share dev1 COM20 COM21   # share auto-creates the virtual ports
+sio read dev1 --all          # merged TX/RX timeline
+sio read dev1 --all -n 50    # last 50 lines
+sio read dev1 --tx           # captured TX only
+sio read dev1 --all -x       # hex framing
+sio shell dev1               # live console with TX overlay
+```
+
+Every session worker (open, tcp, and share) captures every sender to `tx.log`
+with a source tag: bytes written by external programs through a shared virtual
+port are tagged with the public port name (`TX[COM20]`), and bytes sent through
+the session control channel by `sio send`, `sio ask`, or `sio shell` are tagged
+`TX[tcp:<addr>]`. `sio read --all` merges `tx.log` with the RX stream in
+`cache.log` by timestamp:
+
+```
+26-09-17 10:41:02.113 TX[COM20] AT+VER
+26-09-17 10:41:02.150 RX VER 1.2.3
+26-09-17 10:41:05.001 TX[tcp:127.0.0.1:52344] reboot
+26-09-17 10:41:05.870 RX booting...
+```
+
+`sio shell` overlays other senders' live TX as tagged lines while you type:
+
+```
+> AT+CFG          ← typed locally, echoed as usual
+OK
+[COM20→] AT+VER   ← sent by an external program through COM20
+VER 1.2.3
+```
+
+Partial writes are assembled into lines, non-printable bytes are escaped as
+`\xNN`, payloads over 64 bytes are truncated with a byte count, and the shell's
+own sends are filtered out. `tx.log` always keeps the full raw bytes.
+
+With `--all`/`--tx`, `-n` means last N lines and `--to <file>` exports the
+formatted timeline. These views are non-destructive and never advance the check
+cursor; plain `sio read` output stays raw RX bytes. `sio clear` truncates
+`tx.log` together with `cache.log`.
+
 ### Live owners
 
 ```bash
@@ -419,10 +462,21 @@ sio share dev1 COM20 COM21
 `sio shell` connects to the running named session in the foreground, prints serial
 output, and writes submitted lines to the port. It shows an internal `>>` prompt,
 stores per-session command history in `history.log`, supports Up/Down recall,
-and shows the nearest history completion in gray; press Right to accept it.
+and shows the nearest completion in gray; press Right to accept it. Each
+top-level Tab keeps the input prefix local, discards earlier device candidates,
+sends one bare Tab, and collects the next 500 milliseconds of visible device
+output as best-effort candidates. The local prompt is redrawn after that window
+instead of being inserted between response chunks. Device candidates are
+one-shot for the current input line and are discarded when another Tab starts,
+the suggestion is accepted, or the line is submitted or cancelled. Input
+containing whitespace continues to use history completion.
 Entered lines use the same default CRLF line behavior as `send` and `ask`.
-Exiting shell leaves the background worker running. On Windows, one Ctrl+C sends
-byte `0x03` to the device; a second interrupt shortly after exits the shell.
+Ctrl+D and other non-editing control keys are forwarded immediately, sending and
+clearing any pending local prefix first. A standalone Escape is forwarded after
+the short window used to distinguish it from an arrow-key sequence; arrows and
+Backspace remain local editing keys. Exiting shell leaves the background worker
+running. On Windows, one Ctrl+C sends byte `0x03` to the device; a second
+interrupt shortly after exits the shell.
 
 `sio tee` keeps the port open in the foreground and writes serial output to the
 terminal, the requested file, and the session cache.
@@ -434,6 +488,25 @@ the named serial session.
 physical serial session through virtual COM ports. Driver installation remains
 explicit; `sio` should fail with an actionable error if com0com's `setupc.exe`
 is not available.
+
+### Removing virtual ports
+
+```bash
+sio stop dev1
+sio rm dev1
+sio clear --share
+```
+
+`sio stop <session>` and `sio rm <session>` stop that session's worker and
+remove only that session's own virtual port pair (for example `COM20`/`CNCB20`).
+This is the normal way to tear down a share.
+
+`sio clear --share` is the fallback for orphaned virtual ports: it stops every
+sharing session's worker, then removes *all* com0com virtual ports on the
+machine, including ones no longer tracked by any local session (left behind
+after a crash, a manually edited session store, or `setupc.exe` failing
+mid-operation). Use it when a virtual port still exists in Device Manager but
+no `sio` session claims it, or when `stop`/`rm` reports incomplete cleanup.
 
 ### Lifecycle and diagnostics
 

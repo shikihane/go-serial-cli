@@ -79,3 +79,25 @@ func TestShellConsoleKeyBytesReturnsPrintableUnicode(t *testing.T) {
 		t.Fatalf("shellConsoleKeyBytes('A') = %q, want A", string(got))
 	}
 }
+
+func TestShellConsoleKeyBytesReturnsControlCharacters(t *testing.T) {
+	tests := []struct {
+		name string
+		char uint16
+		want byte
+	}{
+		{name: "tab", char: '\t', want: 0x09},
+		{name: "ctrl-c", char: 0x03, want: 0x03},
+		{name: "ctrl-d", char: 0x04, want: 0x04},
+		{name: "escape", char: 0x1b, want: 0x1b},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shellConsoleKeyBytes(keyEventRecord{UnicodeChar: tt.char})
+			if len(got) != 1 || got[0] != tt.want {
+				t.Fatalf("shellConsoleKeyBytes(%#x) = % x, want %02x", tt.char, got, tt.want)
+			}
+		})
+	}
+}

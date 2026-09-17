@@ -8,21 +8,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 type TimedChunk struct {
-	At   time.Time
-	Data []byte
+	At     time.Time
+	Source string
+	Data   []byte
 }
 
 type cacheIndexEntry struct {
 	At     time.Time `json:"at"`
 	Offset int64     `json:"offset"`
 	Length int64     `json:"length"`
+	Source string    `json:"source,omitempty"`
 }
 
 type timedCacheWriter struct {
+	mu    sync.Mutex
 	file  *os.File
 	index *os.File
 }
@@ -62,6 +66,8 @@ func (w *timedCacheWriter) Write(data []byte) (int, error) {
 }
 
 func (w *timedCacheWriter) WriteChunk(chunk TimedChunk) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	data := chunk.Data
 	offset, err := w.file.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -80,6 +86,7 @@ func (w *timedCacheWriter) WriteChunk(chunk TimedChunk) (int, error) {
 			At:     at,
 			Offset: offset,
 			Length: int64(n),
+			Source: chunk.Source,
 		}
 		if err := json.NewEncoder(w.index).Encode(entry); err != nil {
 			return n, err
@@ -135,7 +142,7 @@ func ReadTimedChunks(cachePath string, indexPath string, start int64, data []byt
 		overlapStart := maxInt64(start, entryStart)
 		overlapEnd := minInt64(end, entryEnd)
 		if overlapEnd > overlapStart {
-			chunks = append(chunks, TimedChunk{At: entry.At, Data: data[overlapStart-start : overlapEnd-start]})
+			chunks = append(chunks, TimedChunk{At: entry.At, Source: entry.Source, Data: data[overlapStart-start : overlapEnd-start]})
 			coveredUntil = overlapEnd
 		}
 	}

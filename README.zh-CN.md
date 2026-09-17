@@ -338,6 +338,39 @@ sio clear dev1
 
 用 `read -T` / `read --ts` 可以显示缓存输出对应的分块时间戳。`cache.log` 仍然保持原始字节，时间戳元数据保存在旁边的索引文件里。
 
+### 双向监控（TX + RX）
+
+```bash
+sio share dev1 COM20 COM21   # share 自动创建虚拟口
+sio read dev1 --all          # 合并的 TX/RX 时间线
+sio read dev1 --all -n 50    # 最后 50 行
+sio read dev1 --tx           # 只看捕获的 TX
+sio read dev1 --all -x       # 十六进制输出
+sio shell dev1               # 实时控制台，叠加显示他方 TX
+```
+
+所有会话 worker（open、tcp、share）都会把所有发送方的数据记录到 `tx.log` 并带来源标记：外部程序经共享虚拟口写入的字节按公共口名标记（`TX[COM20]`）；`sio send`、`sio ask`、`sio shell` 经会话控制通道发送的字节标记为 `TX[tcp:<addr>]`。`sio read --all` 按时间戳把 `tx.log` 与 `cache.log` 中的 RX 流合并成一条时间线：
+
+```
+26-09-17 10:41:02.113 TX[COM20] AT+VER
+26-09-17 10:41:02.150 RX VER 1.2.3
+26-09-17 10:41:05.001 TX[tcp:127.0.0.1:52344] reboot
+26-09-17 10:41:05.870 RX booting...
+```
+
+`sio shell` 会在你交互的同时叠加显示其他发送方的实时 TX：
+
+```
+> AT+CFG          ← 自己敲的，正常回显
+OK
+[COM20→] AT+VER   ← 外部程序经 COM20 发的
+VER 1.2.3
+```
+
+碎片写入会拼成整行显示，不可打印字节转义为 `\xNN`，超过 64 字节的负载截断并显示字节数，shell 自己发的内容会被过滤避免重复显示；`tx.log` 始终保存完整原始字节。
+
+`--all`/`--tx` 视图下 `-n` 表示最后 N 行，`--to <file>` 可导出格式化时间线。这些视图是非破坏性的，不推进 check 游标；不带标志的 `sio read` 输出仍是纯 RX 原始字节。`sio clear` 会同时清空 `tx.log` 和 `cache.log`。
+
 ### 实时 owner
 
 ```bash
@@ -347,13 +380,25 @@ sio tcp dev1 :7001
 sio share dev1 COM20 COM21
 ```
 
-`sio shell` 在前台保持命名会话打开，打印串口输出，并把提交的输入行写入串口。它会显示内部 `>>` 提示符，把每个 session 的命令历史保存到 `history.log`，支持上/下方向键召回历史，并用灰色显示最近的历史补全；按右方向键接受补全。输入行使用和 `send`、`ask` 相同的默认 CRLF 行模式。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
+`sio shell` 在前台保持命名会话打开，打印串口输出，并把提交的输入行写入串口。它会显示内部 `>>` 提示符，把每个 session 的命令历史保存到 `history.log`，支持上/下方向键召回历史，并用灰色显示最近的补全；按右方向键接受补全。每次在顶层命令输入中按 Tab，`sio` 都会保留本地前缀、丢弃旧设备候选、只向设备发送一个裸 Tab，并把随后 500 毫秒内仍正常显示的设备输出作为尽力而为的候选；本地提示符会在窗口结束后统一重绘，不会插入设备输出分块之间。设备候选只服务当前输入行；下一次 Tab、按右方向键接受候选、提交或取消输入时都会丢弃。输入中已经包含空白时仍只使用历史补全。输入行使用和 `send`、`ask` 相同的默认 CRLF 行模式。Ctrl+D 和其他非编辑控制键会立即透传，并先发送、再清空已有的本地输入前缀。单独按下 ESC 时，会经过一个用于区分方向键序列的短暂窗口后透传；方向键和 Backspace 仍用于本地编辑。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
 
 `sio tee` 在前台保持端口打开，并把串口输出写到终端、指定文件和会话缓存。
 
 `sio tcp` 启动后台 worker，接受 TCP 客户端并桥接到命名串口会话。
 
 `sio share` 使用 com0com 和内置 Go 字节桥创建虚拟 COM 共享。驱动安装仍然是显式操作；如果找不到 com0com 的 `setupc.exe`，`sio` 应该给出可操作错误。
+
+### 清理虚拟串口
+
+```bash
+sio stop dev1
+sio rm dev1
+sio clear --share
+```
+
+`sio stop <session>` 和 `sio rm <session>` 会停掉该会话的 worker，并只移除这个会话自己的虚拟口对（例如 `COM20`/`CNCB20`）。日常关闭 share 用这个就够。
+
+`sio clear --share` 是处理孤儿虚拟口的兜底命令：它会先停掉所有处于 sharing 状态的会话 worker，然后移除机器上**所有** com0com 虚拟口，包括本地会话记录里已经追踪不到的那些（可能是进程崩溃、手动改过会话存储、或 `setupc.exe` 操作中途失败留下的）。当设备管理器里还能看到虚拟口但 `sio` 已经没有对应会话认领，或者 `stop`/`rm` 报告清理不完整时，用这个命令。
 
 ### 生命周期和诊断
 

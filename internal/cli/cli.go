@@ -55,6 +55,7 @@ type AppDeps struct {
 	SendSessionPayload    func(address string, payload []byte) error
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
+	StreamShell           func(opts serialcmd.ShellStreamOptions) error
 	IsProcessRunning      func(pid int) bool
 	RetrySleep            func(delay time.Duration)
 	Stdin                 io.Reader
@@ -207,6 +208,7 @@ func DefaultDeps() (AppDeps, error) {
 		SendSessionPayload:    serialcmd.SendPayloadToSession,
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
+		StreamShell:           serialcmd.StreamShell,
 		IsProcessRunning:      isProcessRunning,
 		RetrySleep:            time.Sleep,
 		Stdin:                 os.Stdin,
@@ -865,11 +867,48 @@ func (a *App) runShell(args []string, out io.Writer) error {
 		input = wrappedInput
 		out = wrappedOutput
 	}
+	return a.runShellStream(name, input, out)
+}
+
+// runShellStream prefers the shell-specific session stream, which overlays
+// other senders' captured TX as tagged lines. It falls back to the generic
+// stream when no worker control channel or shell streamer is available.
+func (a *App) runShellStream(name string, input io.Reader, out io.Writer) error {
+	if a.deps.Store.Dir != "" && a.deps.StreamShell != nil {
+		state, err := a.deps.Store.Load(name)
+		if err != nil {
+			return err
+		}
+		if state.Paused {
+			return a.pausedSessionError()
+		}
+		if address, ok, err := sessionDialAddress(state); err != nil {
+			return err
+		} else if ok {
+			return a.deps.StreamShell(serialcmd.ShellStreamOptions{
+				Address:          address,
+				Input:            input,
+				Output:           out,
+				TxCachePath:      a.deps.Store.TxCachePath(name),
+				TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
+			})
+		}
+	}
 	return a.runStream(name, serialcmd.StreamOptions{Input: input}, out)
 }
 
 const shellInterruptExitWindow = 2 * time.Second
 const shellInterruptDuplicateWindow = 50 * time.Millisecond
+
+// shellEscapeSequenceDelay leaves enough time for a split arrow-key sequence
+// to arrive while keeping a standalone Escape key responsive.
+const shellEscapeSequenceDelay = 30 * time.Millisecond
+
+// shellCompletionCaptureWindow is the fixed window in which output following
+// a bare Tab query is copied into the in-memory device completion cache.
+const shellCompletionCaptureWindow = 500 * time.Millisecond
+
+const shellCompletionCaptureLimit = 32 * 1024
 
 // shellPromptRedrawDelay is the idle window used to debounce the forced
 // newline and prompt redraw after serial output that does not end with a
@@ -921,6 +960,8 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 
 	return reader, shellOutputWriter{state: state}, func() {
 		state.stopRedrawTimer()
+		state.stopEscapeTimer()
+		state.stopCompletionTimer()
 		close(stop)
 		if notifyCh != nil {
 			signal.Stop(notifyCh)
@@ -959,20 +1000,28 @@ func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}
 }
 
 type shellInputState struct {
-	mu             sync.Mutex
-	lastCtrlC      time.Time
-	echo           io.Writer
-	historyPath    string
-	history        []string
-	historyIndex   int
-	line           []byte
-	cursor         int
-	esc            []byte
-	prompted       bool
-	promptVisible  bool
-	partialPending bool
-	redrawGen      uint64
-	redrawTimer    *time.Timer
+	mu                sync.Mutex
+	inputWriteMu      sync.Mutex
+	lastCtrlC         time.Time
+	echo              io.Writer
+	historyPath       string
+	history           []string
+	historyIndex      int
+	line              []byte
+	cursor            int
+	esc               []byte
+	escapeGen         uint64
+	escapeTimer       *time.Timer
+	completionGen     uint64
+	completionTimer   *time.Timer
+	completionActive  bool
+	completionOutput  []byte
+	deviceCompletions []string
+	prompted          bool
+	promptVisible     bool
+	partialPending    bool
+	redrawGen         uint64
+	redrawTimer       *time.Timer
 }
 
 type shellOutputWriter struct {
@@ -1002,11 +1051,24 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	s.prompt()
 	var writes [][]byte
 	for _, ch := range data {
-		if len(s.esc) > 0 || ch == 0x1b {
-			if err := s.handleEscape(ch); err != nil {
-				s.mu.Unlock()
-				return err
+		if len(s.esc) > 0 {
+			s.esc = append(s.esc, ch)
+			if len(s.esc) == 2 && (ch == '[' || ch == 'O') {
+				s.scheduleEscapeFlushLocked(writer)
+				continue
 			}
+			pending := append([]byte(nil), s.esc...)
+			s.cancelEscapeFlushLocked()
+			s.esc = s.esc[:0]
+			if len(pending) == 3 && s.handleArrow(pending[1], pending[2]) {
+				continue
+			}
+			writes = append(writes, s.takeImmediateInputLocked(pending))
+			continue
+		}
+		if ch == 0x1b {
+			s.esc = append(s.esc[:0], ch)
+			s.scheduleEscapeFlushLocked(writer)
 			continue
 		}
 		if ch == 0x03 {
@@ -1019,6 +1081,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 				return writer.Close()
 			}
 			s.lastCtrlC = now
+			s.discardDeviceCompletionsLocked()
 		}
 		if ch == '\r' || ch == '\n' {
 			s.newline()
@@ -1027,6 +1090,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			s.line = s.line[:0]
 			s.cursor = 0
 			s.historyIndex = len(s.history)
+			s.discardDeviceCompletionsLocked()
 			s.prompted = false
 			s.prompt()
 			continue
@@ -1039,11 +1103,22 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			}
 			continue
 		}
+		if ch == '\t' {
+			prefix := string(s.line)
+			if !strings.ContainsAny(prefix, " \t\r\n") {
+				s.startCompletionCaptureLocked()
+				writes = append(writes, []byte{ch})
+			} else {
+				s.discardDeviceCompletionsLocked()
+			}
+			continue
+		}
 		if ch == 0x03 {
 			writes = append(writes, []byte{ch})
 			continue
 		}
 		if ch < 0x20 {
+			writes = append(writes, s.takeImmediateInputLocked([]byte{ch}))
 			continue
 		}
 		s.line = append(s.line, 0)
@@ -1053,7 +1128,13 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		s.historyIndex = len(s.history)
 		s.redraw()
 	}
+	if len(writes) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	s.inputWriteMu.Lock()
 	s.mu.Unlock()
+	defer s.inputWriteMu.Unlock()
 	for _, payload := range writes {
 		if _, err := writer.Write(payload); err != nil {
 			return err
@@ -1062,9 +1143,25 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	return nil
 }
 
+func (s *shellInputState) takeImmediateInputLocked(control []byte) []byte {
+	hadLine := len(s.line) > 0
+	payload := make([]byte, 0, len(s.line)+len(control))
+	payload = append(payload, s.line...)
+	payload = append(payload, control...)
+	s.line = s.line[:0]
+	s.cursor = 0
+	s.historyIndex = len(s.history)
+	s.discardDeviceCompletionsLocked()
+	if hadLine {
+		s.redraw()
+	}
+	return payload
+}
+
 func (s *shellInputState) writeOutput(data []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.captureCompletionOutputLocked(data)
 	if s.echo == nil {
 		return len(data), nil
 	}
@@ -1087,6 +1184,14 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 		}
 	}
 	if s.prompted {
+		if s.completionActive {
+			if len(data) > 0 && data[len(data)-1] != '\n' {
+				s.partialPending = true
+			} else {
+				s.cancelPartialPendingLocked()
+			}
+			return len(data), nil
+		}
 		if len(data) > 0 && data[len(data)-1] != '\n' {
 			s.partialPending = true
 			s.schedulePromptRedrawLocked()
@@ -1098,6 +1203,139 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 		}
 	}
 	return len(data), nil
+}
+
+// startCompletionCaptureLocked starts a hard-deadline capture. Device output
+// is still rendered normally; the capture only keeps a bounded copy for local
+// completion suggestions. Callers must hold s.mu.
+func (s *shellInputState) startCompletionCaptureLocked() {
+	s.discardDeviceCompletionsLocked()
+	gen := s.completionGen
+	s.completionActive = true
+	s.completionOutput = s.completionOutput[:0]
+	s.completionTimer = time.AfterFunc(shellCompletionCaptureWindow, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if gen != s.completionGen || !s.completionActive {
+			return
+		}
+		s.completionActive = false
+		s.completionTimer = nil
+		s.deviceCompletions = parseShellCompletionCandidates(s.completionOutput)
+		s.completionOutput = s.completionOutput[:0]
+		if s.prompted {
+			s.flushPartialPendingLocked()
+			s.redraw()
+		}
+	})
+}
+
+// captureCompletionOutputLocked appends at most shellCompletionCaptureLimit
+// bytes while a Tab query is active. Callers must hold s.mu.
+func (s *shellInputState) captureCompletionOutputLocked(data []byte) {
+	if !s.completionActive || len(data) == 0 || len(s.completionOutput) >= shellCompletionCaptureLimit {
+		return
+	}
+	remaining := shellCompletionCaptureLimit - len(s.completionOutput)
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	s.completionOutput = append(s.completionOutput, data...)
+}
+
+func (s *shellInputState) stopCompletionTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discardDeviceCompletionsLocked()
+}
+
+// discardDeviceCompletionsLocked makes device-derived suggestions one-shot
+// and prevents an older capture timer from publishing into a later input line.
+// Callers must hold s.mu.
+func (s *shellInputState) discardDeviceCompletionsLocked() {
+	s.completionGen++
+	s.completionActive = false
+	s.completionOutput = s.completionOutput[:0]
+	s.deviceCompletions = nil
+	if s.completionTimer != nil {
+		s.completionTimer.Stop()
+		s.completionTimer = nil
+	}
+}
+
+func parseShellCompletionCandidates(data []byte) []string {
+	fields := strings.Fields(stripShellANSI(data))
+	candidates := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if !isShellCompletionCandidate(field) {
+			continue
+		}
+		if _, ok := seen[field]; ok {
+			continue
+		}
+		seen[field] = struct{}{}
+		candidates = append(candidates, field)
+	}
+	return candidates
+}
+
+func stripShellANSI(data []byte) string {
+	clean := make([]byte, 0, len(data))
+	for i := 0; i < len(data); {
+		if data[i] != 0x1b {
+			clean = append(clean, data[i])
+			i++
+			continue
+		}
+		if i+1 >= len(data) {
+			break
+		}
+		switch data[i+1] {
+		case '[':
+			i += 2
+			for i < len(data) {
+				ch := data[i]
+				i++
+				if ch >= 0x40 && ch <= 0x7e {
+					break
+				}
+			}
+		case ']':
+			i += 2
+			for i < len(data) {
+				if data[i] == 0x07 {
+					i++
+					break
+				}
+				if data[i] == 0x1b && i+1 < len(data) && data[i+1] == '\\' {
+					i += 2
+					break
+				}
+				i++
+			}
+		default:
+			i += 2
+		}
+	}
+	return string(clean)
+}
+
+func isShellCompletionCandidate(candidate string) bool {
+	if candidate == "" || !isShellCompletionAlphaNumeric(candidate[0]) {
+		return false
+	}
+	for i := 1; i < len(candidate); i++ {
+		ch := candidate[i]
+		if !isShellCompletionAlphaNumeric(ch) && ch != '_' && ch != '-' && ch != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func isShellCompletionAlphaNumeric(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
 }
 
 // cancelPartialPendingLocked drops the deferred line break without
@@ -1159,32 +1397,65 @@ func (s *shellInputState) stopRedrawTimer() {
 	}
 }
 
-func (s *shellInputState) handleEscape(ch byte) error {
-	s.esc = append(s.esc, ch)
-	if len(s.esc) == 1 {
-		return nil
+func (s *shellInputState) scheduleEscapeFlushLocked(writer *io.PipeWriter) {
+	s.escapeGen++
+	gen := s.escapeGen
+	if s.escapeTimer != nil {
+		s.escapeTimer.Stop()
 	}
-	if len(s.esc) < 3 {
-		return nil
-	}
-	if s.esc[0] == 0x1b && s.esc[1] == '[' {
-		switch s.esc[2] {
-		case 'A':
-			s.historyUp()
-		case 'B':
-			s.historyDown()
-		case 'C':
-			if s.cursor < len(s.line) {
-				s.moveCursorRight()
-			} else {
-				s.acceptSuggestion()
-			}
-		case 'D':
-			s.moveCursorLeft()
+	s.escapeTimer = time.AfterFunc(shellEscapeSequenceDelay, func() {
+		s.mu.Lock()
+		if gen != s.escapeGen || len(s.esc) == 0 {
+			s.mu.Unlock()
+			return
 		}
+		pending := append([]byte(nil), s.esc...)
+		s.esc = s.esc[:0]
+		s.escapeTimer = nil
+		payload := s.takeImmediateInputLocked(pending)
+		s.inputWriteMu.Lock()
+		s.mu.Unlock()
+		_, _ = writer.Write(payload)
+		s.inputWriteMu.Unlock()
+	})
+}
+
+func (s *shellInputState) cancelEscapeFlushLocked() {
+	s.escapeGen++
+	if s.escapeTimer != nil {
+		s.escapeTimer.Stop()
+		s.escapeTimer = nil
 	}
+}
+
+func (s *shellInputState) stopEscapeTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancelEscapeFlushLocked()
 	s.esc = s.esc[:0]
-	return nil
+}
+
+func (s *shellInputState) handleArrow(prefix byte, key byte) bool {
+	if prefix != '[' && prefix != 'O' {
+		return false
+	}
+	switch key {
+	case 'A':
+		s.historyUp()
+	case 'B':
+		s.historyDown()
+	case 'C':
+		if s.cursor < len(s.line) {
+			s.moveCursorRight()
+		} else {
+			s.acceptSuggestion()
+		}
+	case 'D':
+		s.moveCursorLeft()
+	default:
+		return false
+	}
+	return true
 }
 
 func (s *shellInputState) prompt() {
@@ -1268,30 +1539,49 @@ func (s *shellInputState) historyDown() {
 }
 
 func (s *shellInputState) acceptSuggestion() {
-	prefix := string(s.line)
-	if prefix == "" {
+	item := s.suggestedLine()
+	if item == "" {
 		return
 	}
-	for i := len(s.history) - 1; i >= 0; i-- {
-		item := s.history[i]
-		if item != prefix && strings.HasPrefix(item, prefix) {
-			s.line = []byte(item)
-			s.cursor = len(s.line)
-			s.redraw()
-			return
-		}
-	}
+	s.line = []byte(item)
+	s.cursor = len(s.line)
+	s.discardDeviceCompletionsLocked()
+	s.redraw()
 }
 
 func (s *shellInputState) suggestionSuffix() string {
 	prefix := string(s.line)
+	item := s.suggestedLine()
+	if item == "" {
+		return ""
+	}
+	return strings.TrimPrefix(item, prefix)
+}
+
+func (s *shellInputState) suggestedLine() string {
+	prefix := string(s.line)
 	if prefix == "" {
 		return ""
+	}
+	if item := s.deviceSuggestedLine(prefix); item != "" {
+		return item
 	}
 	for i := len(s.history) - 1; i >= 0; i-- {
 		item := s.history[i]
 		if item != prefix && strings.HasPrefix(item, prefix) {
-			return strings.TrimPrefix(item, prefix)
+			return item
+		}
+	}
+	return ""
+}
+
+func (s *shellInputState) deviceSuggestedLine(prefix string) string {
+	if prefix == "" || strings.ContainsAny(prefix, " \t\r\n") {
+		return ""
+	}
+	for _, item := range s.deviceCompletions {
+		if item != prefix && strings.HasPrefix(item, prefix) {
+			return item
 		}
 	}
 	return ""
@@ -1403,7 +1693,7 @@ func (a *App) runStream(name string, opts serialcmd.StreamOptions, out io.Writer
 
 func (a *App) runRead(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return a.usage("read <session> [-x] [-T] [-n count] [--to file]")
+		return a.usage("read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]")
 	}
 	name := args[0]
 	if err := session.ValidateName(name); err != nil {
@@ -1411,20 +1701,32 @@ func (a *App) runRead(args []string, out io.Writer) error {
 	}
 	fs := flag.NewFlagSet("read", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	n := fs.Int("n", 0, "read last n bytes")
+	n := fs.Int("n", 0, "read last n bytes (lines with --all/--tx)")
 	to := fs.String("to", "", "write cached data to file")
 	outputHex := fs.Bool("x", false, "format cached data as hex")
 	fs.BoolVar(outputHex, "hex", false, "format cached data as hex")
 	showTimestamps := fs.Bool("T", false, "show chunk timestamps")
 	fs.BoolVar(showTimestamps, "ts", false, "show chunk timestamps")
+	allTimeline := fs.Bool("all", false, "show merged TX/RX timeline")
+	txOnly := fs.Bool("tx", false, "show captured TX only")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return a.usage("read <session> [-x] [-T] [-n count] [--to file]")
+		return a.usage("read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]")
 	}
 	if *n < 0 {
 		return errors.New("read count must not be negative")
+	}
+	if *allTimeline && *txOnly {
+		return errors.New("--all and --tx are mutually exclusive")
+	}
+	if *allTimeline || *txOnly {
+		if a.deps.Store.Dir == "" {
+			_, _ = fmt.Fprintln(out, "no cached data")
+			return nil
+		}
+		return a.runReadTimeline(name, *allTimeline, *outputHex, *n, *to, out)
 	}
 	if a.deps.Store.Dir != "" {
 		cachePath := a.deps.Store.CachePath(name)
@@ -1511,6 +1813,39 @@ func (a *App) runRead(args []string, out io.Writer) error {
 	}
 	_, _ = fmt.Fprintln(out, "no cached data, window="+strconv.Itoa(*n))
 	return nil
+}
+
+func (a *App) runReadTimeline(name string, includeRX bool, outputHex bool, n int, to string, out io.Writer) error {
+	var rx []serialcmd.TimedChunk
+	if includeRX {
+		rx = readMonitorChunks(a.deps.Store.CachePath(name), a.deps.Store.CacheIndexPath(name))
+	}
+	tx := readMonitorChunks(a.deps.Store.TxCachePath(name), a.deps.Store.TxCacheIndexPath(name))
+	if len(rx) == 0 && len(tx) == 0 {
+		_, _ = fmt.Fprintln(out, "no cached data")
+		return nil
+	}
+	formatted := serialcmd.FormatMonitorChunks(serialcmd.MergeMonitorChunks(rx, tx), outputHex)
+	if n > 0 {
+		formatted = serialcmd.TailLines(formatted, n)
+	}
+	if to != "" {
+		if err := writeOutputFile(to, formatted); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "wrote %d bytes to %s\n", len(formatted), to)
+		return nil
+	}
+	_, _ = out.Write(formatted)
+	return nil
+}
+
+func readMonitorChunks(cachePath string, indexPath string) []serialcmd.TimedChunk {
+	data, err := os.ReadFile(cachePath)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return serialcmd.ReadTimedChunks(cachePath, indexPath, 0, data)
 }
 
 func copyCacheToFile(cachePath string, destPath string, lastBytes int64) (int64, error) {
@@ -1734,6 +2069,12 @@ func (a *App) runClear(args []string, out io.Writer) error {
 			return err
 		}
 		if err := os.WriteFile(a.deps.Store.CacheIndexPath(name), nil, 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(a.deps.Store.TxCachePath(name), nil, 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(a.deps.Store.TxCacheIndexPath(name), nil, 0o644); err != nil {
 			return err
 		}
 		state, err := a.deps.Store.Load(name)
@@ -2057,11 +2398,13 @@ func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.RunSessionServer(serialcmd.SessionServerOptions{
-			ControlAddress: state.ControlAddress,
-			Port:           state.Port,
-			Baud:           state.Baud,
-			CachePath:      a.deps.Store.CachePath(name),
-			CacheIndexPath: a.deps.Store.CacheIndexPath(name),
+			ControlAddress:   state.ControlAddress,
+			Port:             state.Port,
+			Baud:             state.Baud,
+			CachePath:        a.deps.Store.CachePath(name),
+			CacheIndexPath:   a.deps.Store.CacheIndexPath(name),
+			TxCachePath:      a.deps.Store.TxCachePath(name),
+			TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
 		})
 	})
 }
@@ -2110,13 +2453,16 @@ func (a *App) runWorkerShare(name string, out io.Writer) (retErr error) {
 		}
 		return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 			return a.deps.RunShareBridge(serialcmd.ShareBridgeOptions{
-				PhysicalPort:   state.Port,
-				HubPorts:       append([]string(nil), state.HubPorts...),
-				Baud:           state.Baud,
-				CachePath:      a.deps.Store.CachePath(name),
-				CacheIndexPath: a.deps.Store.CacheIndexPath(name),
-				ControlAddress: controlAddress,
-				TCPAddress:     state.TCPAddress,
+				PhysicalPort:     state.Port,
+				HubPorts:         append([]string(nil), state.HubPorts...),
+				PublicPorts:      append([]string(nil), state.VirtualPorts...),
+				Baud:             state.Baud,
+				CachePath:        a.deps.Store.CachePath(name),
+				CacheIndexPath:   a.deps.Store.CacheIndexPath(name),
+				TxCachePath:      a.deps.Store.TxCachePath(name),
+				TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
+				ControlAddress:   controlAddress,
+				TCPAddress:       state.TCPAddress,
 				OnListening: func(address string) {
 					appendWorkerLog("worker ready listen=" + address)
 				},
@@ -2178,11 +2524,13 @@ func (a *App) runWorkerTCP(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.BridgeTCP(serialcmd.TCPBridgeOptions{
-			ListenAddress:  state.TCPAddress,
-			Port:           state.Port,
-			Baud:           state.Baud,
-			CachePath:      a.deps.Store.CachePath(name),
-			CacheIndexPath: a.deps.Store.CacheIndexPath(name),
+			ListenAddress:    state.TCPAddress,
+			Port:             state.Port,
+			Baud:             state.Baud,
+			CachePath:        a.deps.Store.CachePath(name),
+			CacheIndexPath:   a.deps.Store.CacheIndexPath(name),
+			TxCachePath:      a.deps.Store.TxCachePath(name),
+			TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
 			OnListening: func(address string) {
 				appendWorkerLog("worker ready listen=" + address)
 			},
@@ -2596,7 +2944,7 @@ Usage:
   %[1]s send <session> --file <file>
   %[1]s send <session> --xfile <file>
   %[1]s ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]
-  %[1]s read <session> [-x] [-T] [-n count] [--to file]
+  %[1]s read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]
   %[1]s check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]
   %[1]s clear <session>
   %[1]s clear --share

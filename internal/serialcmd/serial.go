@@ -48,38 +48,45 @@ type AskOptions struct {
 }
 
 type TCPBridgeOptions struct {
-	ListenAddress  string
-	Port           string
-	Baud           int
-	CachePath      string
-	CacheIndexPath string
-	AcceptOne      bool
-	Stop           <-chan struct{}
-	OpenPort       func(port string, baud int) (SerialPort, error)
-	OnListening    func(address string)
+	ListenAddress    string
+	Port             string
+	Baud             int
+	CachePath        string
+	CacheIndexPath   string
+	TxCachePath      string
+	TxCacheIndexPath string
+	AcceptOne        bool
+	Stop             <-chan struct{}
+	OpenPort         func(port string, baud int) (SerialPort, error)
+	OnListening      func(address string)
 }
 
 type SessionServerOptions struct {
-	ControlAddress string
-	Port           string
-	Baud           int
-	CachePath      string
-	CacheIndexPath string
-	Stop           <-chan struct{}
-	OpenPort       func(port string, baud int) (SerialPort, error)
+	ControlAddress   string
+	Port             string
+	Baud             int
+	CachePath        string
+	CacheIndexPath   string
+	TxCachePath      string
+	TxCacheIndexPath string
+	Stop             <-chan struct{}
+	OpenPort         func(port string, baud int) (SerialPort, error)
 }
 
 type ShareBridgeOptions struct {
-	PhysicalPort   string
-	HubPorts       []string
-	Baud           int
-	CachePath      string
-	CacheIndexPath string
-	ControlAddress string
-	TCPAddress     string
-	Stop           <-chan struct{}
-	OpenPort       func(port string, baud int) (SerialPort, error)
-	OnListening    func(address string)
+	PhysicalPort     string
+	HubPorts         []string
+	PublicPorts      []string
+	Baud             int
+	CachePath        string
+	CacheIndexPath   string
+	TxCachePath      string
+	TxCacheIndexPath string
+	ControlAddress   string
+	TCPAddress       string
+	Stop             <-chan struct{}
+	OpenPort         func(port string, baud int) (SerialPort, error)
+	OnListening      func(address string)
 }
 
 func Ports() ([]string, error) {
@@ -357,6 +364,12 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 	}
 	defer closeOutput()
 
+	txOutput, closeTxOutput, err := openTxOutput(opts.TxCachePath, opts.TxCacheIndexPath)
+	if err != nil {
+		return err
+	}
+	defer closeTxOutput()
+
 	listener, err := net.Listen("tcp", opts.ListenAddress)
 	if err != nil {
 		return err
@@ -366,7 +379,7 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 		opts.OnListening(listener.Addr().String())
 	}
 
-	server := newSessionServer(port, output)
+	server := newSessionServer(port, output, txOutput)
 	defer server.closeClients()
 
 	errCh := make(chan error, 3)
@@ -429,13 +442,19 @@ func RunSessionServer(opts SessionServerOptions) error {
 	}
 	defer closeOutput()
 
+	txOutput, closeTxOutput, err := openTxOutput(opts.TxCachePath, opts.TxCacheIndexPath)
+	if err != nil {
+		return err
+	}
+	defer closeTxOutput()
+
 	listener, err := net.Listen("tcp", opts.ControlAddress)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 
-	server := newSessionServer(port, output)
+	server := newSessionServer(port, output, txOutput)
 	defer server.closeClients()
 
 	errCh := make(chan error, 2)
@@ -486,23 +505,33 @@ func ShareBridge(opts ShareBridgeOptions) error {
 	}
 	defer closeOutput()
 
+	txOutput, closeTxOutput, err := openTxOutput(opts.TxCachePath, opts.TxCacheIndexPath)
+	if err != nil {
+		return err
+	}
+	defer closeTxOutput()
+
 	physical, err := openPort(opts.PhysicalPort, opts.Baud)
 	if err != nil {
 		return diag.SerialOpenError(opts.PhysicalPort, err)
 	}
 
 	endpoints := make([]shareEndpoint, 0, len(opts.HubPorts))
-	for _, hubPort := range opts.HubPorts {
+	for i, hubPort := range opts.HubPorts {
 		opened, err := openPort(hubPort, opts.Baud)
 		if err != nil {
 			_ = physical.Close()
 			closeShareEndpoints(endpoints)
 			return diag.SerialOpenError(hubPort, err)
 		}
-		endpoints = append(endpoints, shareEndpoint{name: hubPort, port: opened, writes: make(chan []byte, 256)})
+		label := hubPort
+		if i < len(opts.PublicPorts) && opts.PublicPorts[i] != "" {
+			label = opts.PublicPorts[i]
+		}
+		endpoints = append(endpoints, shareEndpoint{name: hubPort, label: label, port: opened, writes: make(chan []byte, 256)})
 	}
 
-	bridge := newShareBridge(opts.PhysicalPort, physical, endpoints, output)
+	bridge := newShareBridge(opts.PhysicalPort, physical, endpoints, output, txOutput)
 	defer bridge.close()
 
 	var listeners []net.Listener
@@ -613,15 +642,17 @@ func StreamSession(address string, input io.Reader, output io.Writer) error {
 }
 
 type sessionServer struct {
-	port    SerialPort
-	output  io.Writer
-	mu      sync.Mutex
-	writeMu sync.Mutex
-	clients map[net.Conn]struct{}
+	port     SerialPort
+	output   io.Writer
+	txOutput io.Writer
+	mu       sync.Mutex
+	writeMu  sync.Mutex
+	clients  map[net.Conn]struct{}
 }
 
 type shareEndpoint struct {
 	name   string
+	label  string
 	port   SerialPort
 	writes chan []byte
 }
@@ -631,6 +662,7 @@ type shareBridge struct {
 	physical     SerialPort
 	endpoints    []shareEndpoint
 	output       io.Writer
+	txOutput     io.Writer
 	mu           sync.Mutex
 	writeMu      sync.Mutex
 	clients      map[net.Conn]struct{}
@@ -638,20 +670,44 @@ type shareBridge struct {
 	closeOnce    sync.Once
 }
 
-func newSessionServer(port SerialPort, output io.Writer) *sessionServer {
+func newSessionServer(port SerialPort, output io.Writer, txOutput io.Writer) *sessionServer {
+	if txOutput == nil {
+		txOutput = io.Discard
+	}
 	return &sessionServer{
-		port:    port,
-		output:  output,
-		clients: map[net.Conn]struct{}{},
+		port:     port,
+		output:   output,
+		txOutput: txOutput,
+		clients:  map[net.Conn]struct{}{},
 	}
 }
 
-func newShareBridge(physicalName string, physical SerialPort, endpoints []shareEndpoint, output io.Writer) *shareBridge {
+func openTxOutput(txCachePath string, txCacheIndexPath string) (io.Writer, func(), error) {
+	indexPath := txCacheIndexPath
+	if txCachePath != "" && indexPath == "" {
+		indexPath = CacheIndexPath(txCachePath)
+	}
+	return OpenTimedCacheWriter(txCachePath, indexPath)
+}
+
+func captureTXChunk(txOutput io.Writer, source string, data []byte) error {
+	chunk := TimedChunk{At: time.Now().Local(), Source: source, Data: data}
+	if _, err := WriteTimedChunks(txOutput, []TimedChunk{chunk}); err != nil {
+		return fmt.Errorf("write tx capture: %w", err)
+	}
+	return nil
+}
+
+func newShareBridge(physicalName string, physical SerialPort, endpoints []shareEndpoint, output io.Writer, txOutput io.Writer) *shareBridge {
+	if txOutput == nil {
+		txOutput = io.Discard
+	}
 	return &shareBridge{
 		physicalName: physicalName,
 		physical:     physical,
 		endpoints:    endpoints,
 		output:       output,
+		txOutput:     txOutput,
 		clients:      map[net.Conn]struct{}{},
 	}
 }
@@ -728,6 +784,7 @@ func (b *shareBridge) closeClients() {
 
 func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
 	defer b.removeClient(conn)
+	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
@@ -735,6 +792,9 @@ func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
 			data := append([]byte(nil), buf[:n]...)
 			if writeErr := b.writePhysical(data); writeErr != nil {
 				return writeErr
+			}
+			if captureErr := b.captureTX(label, data); captureErr != nil {
+				return captureErr
 			}
 		}
 		if err != nil {
@@ -763,7 +823,14 @@ func (b *shareBridge) copyEndpointToOthers(source shareEndpoint) error {
 }
 
 func (b *shareBridge) routeEndpointData(source shareEndpoint, data []byte) error {
-	return b.writePhysical(data)
+	if err := b.writePhysical(data); err != nil {
+		return err
+	}
+	return b.captureTX(source.label, data)
+}
+
+func (b *shareBridge) captureTX(source string, data []byte) error {
+	return captureTXChunk(b.txOutput, source, data)
 }
 
 func (b *shareBridge) writePhysical(data []byte) error {
@@ -875,15 +942,20 @@ func (s *sessionServer) closeClients() {
 
 func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 	defer s.removeClient(conn)
+	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
+			data := append([]byte(nil), buf[:n]...)
 			s.writeMu.Lock()
-			_, writeErr := s.port.Write(buf[:n])
+			_, writeErr := s.port.Write(data)
 			s.writeMu.Unlock()
 			if writeErr != nil {
 				return fmt.Errorf("write serial port %s: %w", portName, writeErr)
+			}
+			if captureErr := captureTXChunk(s.txOutput, label, data); captureErr != nil {
+				return captureErr
 			}
 		}
 		if err != nil {
@@ -1024,7 +1096,17 @@ func copyInputToPort(input io.Reader, port io.Writer, portName string) error {
 			}
 			return err
 		}
-		if isImmediateControlByte(ch) && len(line) == 0 {
+		if isImmediateControlByte(ch) {
+			if len(line) > 0 {
+				payload, parseErr := parsePayload(string(line))
+				if parseErr != nil {
+					return parseErr
+				}
+				if writeErr := writePayloadToPort(payload, port, portName); writeErr != nil {
+					return writeErr
+				}
+				line = line[:0]
+			}
 			if err := writePayloadToPort([]byte{ch}, port, portName); err != nil {
 				return err
 			}
@@ -1064,7 +1146,7 @@ func writePayloadToPort(payload []byte, port io.Writer, portName string) error {
 }
 
 func isImmediateControlByte(ch byte) bool {
-	return ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t'
+	return ch < 0x20 && ch != '\r' && ch != '\n'
 }
 
 func copyPortToOutput(port io.Reader, output io.Writer, portName string) error {

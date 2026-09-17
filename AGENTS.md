@@ -21,6 +21,8 @@ sio ask dev1 ATI -t 1.5 -l 5
 sio share dev1 COM20 COM21
 sio read dev1 -n 200
 sio read dev1 --to serial-cache.log
+sio read dev1 --all -n 50
+sio read dev1 --tx
 sio check dev1 -n 200
 sio check dev1 --rewind 2000
 sio clear dev1
@@ -33,6 +35,7 @@ sio status dev1
 sio log dev1
 sio stop dev1
 sio rm dev1
+sio clear --share
 sio list
 sio skill install
 ```
@@ -89,9 +92,11 @@ Use `go.bug.st/serial` for serial behavior. Do not shell out to PowerShell for c
 
 `sio read <session>` reads from that session's local cache file without consuming, truncating, or advancing any cursor. Background workers and `tee` append serial output to that cache when they own a readable serial stream. Large cache reads should use `sio read <session> --to <file>` so data is streamed into a file instead of dumped to the terminal; `-n` may be combined with `--to` to export only the last N bytes.
 
-`sio check <session>` is the incremental-read command. It reads from the saved check cursor and advances that cursor only to the bytes it emitted. Use `sio check <session> --rewind <bytes>` to back up if important output was missed, or `sio check <session> --from <offset>` to inspect from an absolute cache offset. `sio clear <session>` resets both cache contents and the check cursor.
+`sio check <session>` is the incremental-read command. It reads from the saved check cursor and advances that cursor only to the bytes it emitted. Use `sio check <session> --rewind <bytes>` to back up if important output was missed, or `sio check <session> --from <offset>` to inspect from an absolute cache offset. `sio clear <session>` resets cache contents (`cache.log` and `tx.log`) and the check cursor.
 
-`sio shell <session>` connects to the named session worker in the foreground when it is running. It continuously prints serial output, shows an internal `>>` input prompt, and writes submitted lines to the port. Exiting shell must leave the background session worker running. Entered lines use the same default CRLF line mode as `sio send`. Shell history is per session in `history.log`; Up/Down recall history, Left/Right move the cursor for in-line editing, gray completion suggests the most recent matching entry, and Right at end of line accepts the suggestion.
+`sio read <session> --all` prints a merged, timestamped TX/RX timeline; `--tx` shows captured TX only. Every session worker (open, tcp, share) captures every sender to `tx.log` with a source tag: external programs writing through shared virtual ports are tagged by public port name (`TX[COM20]`), and control-channel sends from `sio send`/`ask`/`shell` are tagged `TX[tcp:<addr>]`. With `--all`/`--tx`, `-n` means last N lines and `-x` switches to hex; text mode escapes non-printable bytes as `\xNN` for display while `tx.log` keeps raw bytes. These views are non-destructive and never advance the check cursor; plain `sio read` output stays raw RX bytes. `sio shell` also overlays other senders' live TX as tagged lines (`[COM20→] ...`), assembling partial writes, escaping non-printables, truncating payloads over 64 bytes, and filtering the shell's own sends.
+
+`sio shell <session>` connects to the named session worker in the foreground when it is running. It continuously prints serial output, shows an internal `>>` input prompt, and writes submitted lines to the port. Exiting shell must leave the background session worker running. Entered lines use the same default CRLF line mode as `sio send`. Shell history is per session in `history.log`; Up/Down recall history, Left/Right move the cursor for in-line editing, gray completion suggests the first matching device candidate or the most recent matching history entry, and Right at end of line accepts the suggestion. For a top-level input prefix, every Tab must keep the local line unchanged, discard prior device candidates, and send only a bare Tab. Device output remains visible while output from the next 500 milliseconds is copied into a bounded, in-memory candidate cache; suppress local prompt redraws until that window finishes so the prompt is not inserted between device response chunks. Device candidates are one-shot for the current input line and must be discarded when another Tab starts, a suggestion is accepted, or the line is submitted or cancelled. Lines containing whitespace use history completion only. Ctrl+D and other non-editing control keys are forwarded immediately; any pending local prefix is sent before the control byte and then cleared. A standalone Escape is forwarded after a short arrow-sequence disambiguation window. Arrow keys and Backspace remain local editing keys. One Ctrl+C sends byte `0x03` to the device; a second press shortly after exits the shell.
 
 `sio tee <session> <file>` opens the named session port and keeps it open in the foreground. It continuously writes serial output to both the screen and the file, and also appends output to the local cache file used by `sio read <session>`.
 
@@ -110,6 +115,8 @@ Background workers append lifecycle and retry diagnostics to each session's `wor
 `sio stop <session>` stops only the named session's worker process, removes only that session's virtual port pairs, and clears live resource state. It must not stop other sessions because multiple agents may be controlling different devices.
 
 `sio rm <session>` performs the same named-session live cleanup as `sio stop <session>`, then deletes that session directory including `state.json`, `cache.log`, `worker.log`, and extracted tools. It must not remove other sessions.
+
+`sio clear --share` is the orphaned-virtual-port fallback: it stops every sharing session's worker, then removes all com0com virtual ports on the machine, including ones no longer tracked by any local session. Reach for it when a virtual port still exists but no session claims it, or when `stop`/`rm` reports incomplete cleanup; prefer per-session `stop`/`rm` otherwise.
 
 ## Development Rules
 

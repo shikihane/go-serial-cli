@@ -200,6 +200,32 @@ func TestCopyInputToPortWritesRawControlByteImmediately(t *testing.T) {
 	}
 }
 
+func TestCopyInputToPortWritesCompletionPrefixAndTabImmediately(t *testing.T) {
+	inputReader, inputWriter := io.Pipe()
+	port := newMemorySerialPort()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- copyInputToPort(inputReader, port, "COM3")
+	}()
+
+	if _, err := inputWriter.Write([]byte("he\t")); err != nil {
+		t.Fatalf("input Write returned error: %v", err)
+	}
+	if got := port.waitWritten(t); got != "he\t" {
+		t.Fatalf("written data = %q, want completion prefix and Tab", got)
+	}
+	_ = inputWriter.Close()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("copyInputToPort returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("copyInputToPort did not return after input closed")
+	}
+}
+
 func TestStreamOutputWritesScreenTeeAndCache(t *testing.T) {
 	dir := t.TempDir()
 	var screen bytes.Buffer
@@ -762,6 +788,114 @@ func TestShareBridgeRoutesControlClientInputOnlyToPhysical(t *testing.T) {
 	}
 	if got := hubB.waitWritten(t); got != "OK\r\n" {
 		t.Fatalf("hubB write = %q, want OK CRLF", got)
+	}
+}
+
+func TestShareBridgeCapturesEndpointTXWithSource(t *testing.T) {
+	dir := t.TempDir()
+	txPath := filepath.Join(dir, "tx.log")
+	txIndexPath := filepath.Join(dir, "tx.index.jsonl")
+	physical := newMemorySerialPort()
+	hubA := newMemorySerialPort()
+	hubB := newMemorySerialPort()
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ShareBridge(ShareBridgeOptions{
+			PhysicalPort:     "COM3",
+			HubPorts:         []string{"CNCB20", "CNCB21"},
+			PublicPorts:      []string{"COM20", "COM21"},
+			Baud:             115200,
+			TxCachePath:      txPath,
+			TxCacheIndexPath: txIndexPath,
+			Stop:             stop,
+			OpenPort: openMemoryPorts(t, map[string]*memorySerialPort{
+				"COM3":   physical,
+				"CNCB20": hubA,
+				"CNCB21": hubB,
+			}),
+		})
+	}()
+	defer stopShareBridge(t, stop, errCh)
+
+	hubA.injectRead("AT1\r\n")
+	if got := physical.waitWritten(t); got != "AT1\r\n" {
+		t.Fatalf("physical write = %q, want AT1 CRLF", got)
+	}
+	hubB.injectRead("AT2\r\n")
+	if got := physical.waitWritten(t); got != "AT1\r\nAT2\r\n" {
+		t.Fatalf("physical write = %q, want AT1+AT2", got)
+	}
+	waitForFileContent(t, txPath, "AT1\r\nAT2\r\n")
+
+	data, err := os.ReadFile(txPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	chunks := ReadTimedChunks(txPath, txIndexPath, 0, data)
+	if len(chunks) != 2 {
+		t.Fatalf("tx chunks = %d, want 2", len(chunks))
+	}
+	if chunks[0].Source != "COM20" || string(chunks[0].Data) != "AT1\r\n" {
+		t.Fatalf("chunk[0] = %q source %q, want AT1 from COM20", chunks[0].Data, chunks[0].Source)
+	}
+	if chunks[1].Source != "COM21" || string(chunks[1].Data) != "AT2\r\n" {
+		t.Fatalf("chunk[1] = %q source %q, want AT2 from COM21", chunks[1].Data, chunks[1].Source)
+	}
+}
+
+func TestShareBridgeCapturesControlClientAndHubTXWithSource(t *testing.T) {
+	dir := t.TempDir()
+	txPath := filepath.Join(dir, "tx.log")
+	txIndexPath := filepath.Join(dir, "tx.index.jsonl")
+	address := freeTCPAddress(t)
+	physical := newMemorySerialPort()
+	hubA := newMemorySerialPort()
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ShareBridge(ShareBridgeOptions{
+			PhysicalPort:     "COM3",
+			HubPorts:         []string{"CNCB20"},
+			Baud:             115200,
+			ControlAddress:   address,
+			TxCachePath:      txPath,
+			TxCacheIndexPath: txIndexPath,
+			Stop:             stop,
+			OpenPort: openMemoryPorts(t, map[string]*memorySerialPort{
+				"COM3":   physical,
+				"CNCB20": hubA,
+			}),
+		})
+	}()
+	defer stopShareBridge(t, stop, errCh)
+	waitForTCPServer(t, address)
+
+	if err := SendToSession(address, "help\\r\\n"); err != nil {
+		t.Fatalf("SendToSession returned error: %v", err)
+	}
+	if got := physical.waitWritten(t); got != "help\r\n" {
+		t.Fatalf("physical write = %q, want help CRLF", got)
+	}
+	hubA.injectRead("AT\r\n")
+	if got := physical.waitWritten(t); got != "help\r\nAT\r\n" {
+		t.Fatalf("physical write = %q, want help+AT", got)
+	}
+	waitForFileContent(t, txPath, "help\r\nAT\r\n")
+
+	data, err := os.ReadFile(txPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	chunks := ReadTimedChunks(txPath, txIndexPath, 0, data)
+	if len(chunks) != 2 {
+		t.Fatalf("tx chunks = %d, want 2", len(chunks))
+	}
+	if !strings.HasPrefix(chunks[0].Source, "tcp:127.0.0.1:") || string(chunks[0].Data) != "help\r\n" {
+		t.Fatalf("chunk[0] = %q source %q, want help from tcp client", chunks[0].Data, chunks[0].Source)
+	}
+	if chunks[1].Source != "CNCB20" || string(chunks[1].Data) != "AT\r\n" {
+		t.Fatalf("chunk[1] = %q source %q, want AT from CNCB20 fallback label", chunks[1].Data, chunks[1].Source)
 	}
 }
 

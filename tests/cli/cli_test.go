@@ -193,7 +193,7 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"sio send <session> --file <file>",
 		"sio send <session> --xfile <file>",
 		"sio ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]",
-		"sio read <session> [-x] [-T] [-n count] [--to file]",
+		"sio read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]",
 		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
 	} {
 		if !strings.Contains(got, want) {
@@ -573,6 +573,59 @@ func TestShellForwardsFirstRawCtrlCByteAndSecondExits(t *testing.T) {
 	}
 }
 
+func TestShellForwardsRawControlKeysToStreamInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []byte
+		want  []byte
+	}{
+		{name: "ctrl-d flushes pending input", input: []byte{'c', 'a', 't', 0x04}, want: []byte{'c', 'a', 't', 0x04}},
+		{name: "escape flushes pending input", input: []byte{'v', 'i', 0x1b}, want: []byte{'v', 'i', 0x1b}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			stdin, stdinWriter := io.Pipe()
+			defer stdinWriter.Close()
+			store := session.Store{Dir: t.TempDir()}
+			if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+				t.Fatalf("Save returned error: %v", err)
+			}
+
+			app := cli.New(cli.AppDeps{
+				Store:           store,
+				Stdin:           stdin,
+				ShellInterrupts: make(chan os.Signal),
+				StreamSerial: func(opts serialcmd.StreamOptions) error {
+					if _, err := stdinWriter.Write(tt.input); err != nil {
+						return fmt.Errorf("write input % x: %w", tt.input, err)
+					}
+					got := make([]byte, len(tt.want))
+					select {
+					case err := <-readOneByte(opts.Input, got):
+						if err != nil {
+							return fmt.Errorf("read input % x: %w", tt.input, err)
+						}
+						if !bytes.Equal(got, tt.want) {
+							return fmt.Errorf("stream input = % x, want % x", got, tt.want)
+						}
+					case <-time.After(250 * time.Millisecond):
+						_ = stdinWriter.Close()
+						return fmt.Errorf("timed out waiting for input % x", tt.input)
+					}
+					_ = stdinWriter.Close()
+					return nil
+				},
+			})
+
+			if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+		})
+	}
+}
+
 func TestShellEchoesRawConsoleInput(t *testing.T) {
 	var out bytes.Buffer
 	stdin, stdinWriter := io.Pipe()
@@ -786,6 +839,339 @@ func TestShellRightAcceptsHistorySuggestion(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, "\x1b[90mI\x1b[0m") {
 		t.Fatalf("output = %q, want gray suggestion suffix", got)
+	}
+}
+
+func TestShellUsesDeviceTabOutputAsSuggestion(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("wi\t")); err != nil {
+				return fmt.Errorf("write prefix and Tab: %w", err)
+			}
+
+			query := make([]byte, 1)
+			if _, err := io.ReadFull(opts.Input, query); err != nil {
+				return fmt.Errorf("read completion query: %w", err)
+			}
+			if !bytes.Equal(query, []byte{'\t'}) {
+				return fmt.Errorf("completion query = %q, want bare Tab", query)
+			}
+
+			firstChunk := "[INF] wifi: reconnecting\r\nuart:~$\r\n.-.-.-.-.-.-.-.-\r\n"
+			if _, err := opts.Output.Write([]byte(firstChunk)); err != nil {
+				return fmt.Errorf("write first device completion chunk: %w", err)
+			}
+			if strings.Contains(out.String(), ".-.-.-.-.-.-.-.-\r\n\r\x1b[2K>> wi") {
+				return fmt.Errorf("local prompt was redrawn inside device completion output: %q", out.String())
+			}
+			secondChunk := "  \x1b[32mwifi\x1b[0m            wifi_cdc_shell\r\nuart:~$"
+			if _, err := opts.Output.Write([]byte(secondChunk)); err != nil {
+				return fmt.Errorf("write second device completion chunk: %w", err)
+			}
+
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> wi\x1b[90mfi\x1b[0m") {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for device suggestion; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			if _, err := stdinWriter.Write([]byte("\x1b[C")); err != nil {
+				return fmt.Errorf("accept device suggestion: %w", err)
+			}
+			deadline = time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> wifi") {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for accepted device suggestion; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if strings.Contains(out.String(), ">> wifi\x1b[90m_cdc_shell\x1b[0m") {
+				return fmt.Errorf("accepted device suggestion exposed another stale suggestion: %q", out.String())
+			}
+			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
+				return fmt.Errorf("submit accepted device suggestion: %w", err)
+			}
+			committed := make([]byte, len("wifi\n"))
+			if _, err := io.ReadFull(opts.Input, committed); err != nil {
+				return fmt.Errorf("read committed completion: %w", err)
+			}
+			if string(committed) != "wifi\n" {
+				return fmt.Errorf("committed input = %q, want %q", committed, "wifi\\n")
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "\x1b[32mwifi\x1b[0m            wifi_cdc_shell") {
+		t.Fatalf("output = %q, want raw device completion list to remain visible", got)
+	}
+	if got := out.String(); !strings.Contains(got, "[INF] wifi: reconnecting") {
+		t.Fatalf("output = %q, want interleaved device log to remain visible", got)
+	}
+}
+
+func TestShellDiscardsPreviousDeviceSuggestionBeforeNextTabQuery(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("wi\t")); err != nil {
+				return fmt.Errorf("write first completion query: %w", err)
+			}
+			query := make([]byte, 1)
+			if _, err := io.ReadFull(opts.Input, query); err != nil {
+				return fmt.Errorf("read first completion query: %w", err)
+			}
+			if !bytes.Equal(query, []byte{'\t'}) {
+				return fmt.Errorf("first completion query = %q, want bare Tab", query)
+			}
+			if _, err := opts.Output.Write([]byte("  wifi  wifi_cdc_shell\r\n")); err != nil {
+				return fmt.Errorf("write device completion output: %w", err)
+			}
+
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> wi\x1b[90mfi\x1b[0m") {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for cached suggestion; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			if _, err := stdinWriter.Write([]byte("\t")); err != nil {
+				return fmt.Errorf("write second completion query: %w", err)
+			}
+			secondQuery := make([]byte, 1)
+			select {
+			case err := <-readOneByte(opts.Input, secondQuery):
+				if err != nil {
+					return fmt.Errorf("read second completion query: %w", err)
+				}
+			case <-time.After(250 * time.Millisecond):
+				_ = stdinWriter.Close()
+				return errors.New("timed out waiting for second bare Tab query")
+			}
+			if !bytes.Equal(secondQuery, []byte{'\t'}) {
+				return fmt.Errorf("second completion query = %q, want bare Tab", secondQuery)
+			}
+
+			if _, err := stdinWriter.Write([]byte("\x1b[C\r")); err != nil {
+				return fmt.Errorf("submit while replacement query is pending: %w", err)
+			}
+			committed := make([]byte, len("wi\n"))
+			if _, err := io.ReadFull(opts.Input, committed); err != nil {
+				return fmt.Errorf("read input after replacement query: %w", err)
+			}
+			if string(committed) != "wi\n" {
+				return fmt.Errorf("input after replacement query = %q, want old suggestion discarded", committed)
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellDiscardsDeviceSuggestionsAfterSubmittingCurrentLine(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("wi\t")); err != nil {
+				return fmt.Errorf("write completion query: %w", err)
+			}
+			query := make([]byte, 1)
+			if _, err := io.ReadFull(opts.Input, query); err != nil {
+				return fmt.Errorf("read completion query: %w", err)
+			}
+			if !bytes.Equal(query, []byte{'\t'}) {
+				return fmt.Errorf("completion query = %q, want bare Tab", query)
+			}
+			if _, err := opts.Output.Write([]byte("  wifi  wifi_cdc_shell\r\n")); err != nil {
+				return fmt.Errorf("write device completion output: %w", err)
+			}
+
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(out.String(), ">> wi\x1b[90mfi\x1b[0m") {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for device suggestion; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
+				return fmt.Errorf("submit first line without accepting suggestion: %w", err)
+			}
+			firstLine := make([]byte, len("wi\n"))
+			if _, err := io.ReadFull(opts.Input, firstLine); err != nil {
+				return fmt.Errorf("read first submitted line: %w", err)
+			}
+			if string(firstLine) != "wi\n" {
+				return fmt.Errorf("first submitted line = %q, want %q", firstLine, "wi\\n")
+			}
+
+			if _, err := stdinWriter.Write([]byte("wi\x1b[C\r")); err != nil {
+				return fmt.Errorf("submit next line without another Tab: %w", err)
+			}
+			secondLine := make([]byte, len("wi\n"))
+			if _, err := io.ReadFull(opts.Input, secondLine); err != nil {
+				return fmt.Errorf("read second submitted line: %w", err)
+			}
+			if string(secondLine) != "wi\n" {
+				return fmt.Errorf("second submitted line = %q, want old device source discarded", secondLine)
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellCancelsPendingDeviceSuggestionsWhenLineIsSubmitted(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("wi\t")); err != nil {
+				return fmt.Errorf("write completion query: %w", err)
+			}
+			query := make([]byte, 1)
+			if _, err := io.ReadFull(opts.Input, query); err != nil {
+				return fmt.Errorf("read completion query: %w", err)
+			}
+			if !bytes.Equal(query, []byte{'\t'}) {
+				return fmt.Errorf("completion query = %q, want bare Tab", query)
+			}
+			if _, err := opts.Output.Write([]byte("  wifi  wifi_cdc_shell\r\n")); err != nil {
+				return fmt.Errorf("write device completion output: %w", err)
+			}
+
+			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
+				return fmt.Errorf("submit while completion capture is pending: %w", err)
+			}
+			firstLine := make([]byte, len("wi\n"))
+			if _, err := io.ReadFull(opts.Input, firstLine); err != nil {
+				return fmt.Errorf("read first submitted line: %w", err)
+			}
+			if string(firstLine) != "wi\n" {
+				return fmt.Errorf("first submitted line = %q, want %q", firstLine, "wi\\n")
+			}
+
+			time.Sleep(650 * time.Millisecond)
+			if _, err := stdinWriter.Write([]byte("wi\x1b[C\r")); err != nil {
+				return fmt.Errorf("submit next line after old capture deadline: %w", err)
+			}
+			secondLine := make([]byte, len("wi\n"))
+			if _, err := io.ReadFull(opts.Input, secondLine); err != nil {
+				return fmt.Errorf("read second submitted line: %w", err)
+			}
+			if string(secondLine) != "wi\n" {
+				return fmt.Errorf("second submitted line = %q, want pending device source cancelled", secondLine)
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellUsesHistoryInsteadOfDeviceQueryForSubcommandCompletion(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.HistoryPath("dev1"), []byte("wifi scan\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile history returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("wifi \t\x1b[C\r")); err != nil {
+				return fmt.Errorf("complete subcommand from history: %w", err)
+			}
+			committed := make([]byte, len("wifi scan\n"))
+			if _, err := io.ReadFull(opts.Input, committed); err != nil {
+				return fmt.Errorf("read subcommand commit: %w", err)
+			}
+			if string(committed) != "wifi scan\n" {
+				return fmt.Errorf("subcommand stream input = %q, want only %q", committed, "wifi scan\\n")
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }
 
@@ -2342,6 +2728,246 @@ func TestClearResetsCacheIndex(t *testing.T) {
 	}
 }
 
+func TestClearResetsTxCache(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(store.TxCachePath("dev1"), []byte("AT\r\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile tx cache returned error: %v", err)
+	}
+	if err := os.WriteFile(store.TxCacheIndexPath("dev1"), []byte(`{"at":"2026-05-02T12:00:00+08:00","offset":0,"length":4,"source":"COM20"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile tx index returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"clear", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for _, path := range []string{store.TxCachePath("dev1"), store.TxCacheIndexPath("dev1")} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) returned error: %v", path, err)
+		}
+		if len(data) != 0 {
+			t.Fatalf("%s = %q, want empty", path, string(data))
+		}
+	}
+}
+
+func writeMonitorFixture(t *testing.T, store session.Store) {
+	t.Helper()
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	base := time.Date(2026, 9, 17, 10, 0, 1, 0, time.Local)
+	rxWriter, closeRx, err := serialcmd.OpenTimedCacheWriter(store.CachePath("dev1"), store.CacheIndexPath("dev1"))
+	if err != nil {
+		t.Fatalf("OpenTimedCacheWriter rx returned error: %v", err)
+	}
+	if _, err := serialcmd.WriteTimedChunks(rxWriter, []serialcmd.TimedChunk{
+		{At: base.Add(500 * time.Millisecond), Data: []byte("VER 1.2\r\n")},
+		{At: base.Add(2 * time.Second), Data: []byte("OK\r\n")},
+	}); err != nil {
+		t.Fatalf("WriteTimedChunks rx returned error: %v", err)
+	}
+	closeRx()
+	txWriter, closeTx, err := serialcmd.OpenTimedCacheWriter(store.TxCachePath("dev1"), store.TxCacheIndexPath("dev1"))
+	if err != nil {
+		t.Fatalf("OpenTimedCacheWriter tx returned error: %v", err)
+	}
+	if _, err := serialcmd.WriteTimedChunks(txWriter, []serialcmd.TimedChunk{
+		{At: base, Source: "COM20", Data: []byte("AT+VER\r\n")},
+		{At: base.Add(time.Second), Source: "COM21", Data: []byte("AT+STAT\r\n")},
+	}); err != nil {
+		t.Fatalf("WriteTimedChunks tx returned error: %v", err)
+	}
+	closeTx()
+}
+
+func TestReadAllPrintsMergedTimeline(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	writeMonitorFixture(t, store)
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--all"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{
+		"TX[COM20] AT+VER",
+		"RX VER 1.2",
+		"TX[COM21] AT+STAT",
+		"RX OK",
+	})
+}
+
+func TestReadAllLimitsLastLines(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	writeMonitorFixture(t, store)
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--all", "-n", "2"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{
+		"TX[COM21] AT+STAT",
+		"RX OK",
+	})
+}
+
+func TestReadAllPrintsHex(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	writeMonitorFixture(t, store)
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--all", "-x", "-n", "1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{
+		"RX 4f 4b 0d 0a",
+	})
+}
+
+func TestReadTxPrintsOnlyCapturedTX(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	writeMonitorFixture(t, store)
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--tx"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	assertTimestampedLines(t, out.String(), []string{
+		"TX[COM20] AT+VER",
+		"TX[COM21] AT+STAT",
+	})
+}
+
+func TestReadAllWritesTimelineToFile(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	writeMonitorFixture(t, store)
+	dest := filepath.Join(t.TempDir(), "timeline.log")
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--all", "--to", dest}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	assertTimestampedLines(t, string(data), []string{
+		"TX[COM20] AT+VER",
+		"RX VER 1.2",
+		"TX[COM21] AT+STAT",
+		"RX OK",
+	})
+	if !strings.Contains(out.String(), "wrote ") {
+		t.Fatalf("output = %q, want wrote confirmation", out.String())
+	}
+}
+
+func TestReadAllWithoutDataPrintsNoCachedData(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store})
+
+	if err := app.Run([]string{"read", "dev1", "--all"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "no cached data") {
+		t.Fatalf("output = %q, want no cached data", out.String())
+	}
+}
+
+func TestReadRejectsAllWithTx(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	app := cli.New(cli.AppDeps{Store: store})
+
+	err := app.Run([]string{"read", "dev1", "--all", "--tx"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("err = %v, want mutually exclusive error", err)
+	}
+}
+
+func TestMonitorCommandIsRemoved(t *testing.T) {
+	var out bytes.Buffer
+	app := cli.New(cli.AppDeps{})
+
+	err := app.Run([]string{"monitor", "dev1"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("err = %v, want unknown command", err)
+	}
+}
+
+func TestShellStreamsWithTXOverlayPaths(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{
+		Name:           "dev1",
+		Port:           "COM3",
+		Baud:           115200,
+		Status:         session.StatusConfigured,
+		WorkerPID:      4321,
+		ControlAddress: "127.0.0.1:7005",
+	}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	called := false
+	app := cli.New(cli.AppDeps{
+		Store:            store,
+		Stdin:            strings.NewReader(""),
+		IsProcessRunning: func(pid int) bool { return pid == 4321 },
+		StreamShell: func(opts serialcmd.ShellStreamOptions) error {
+			called = true
+			if opts.Address != "127.0.0.1:7005" {
+				t.Fatalf("Address = %q, want control address", opts.Address)
+			}
+			if opts.TxCachePath != store.TxCachePath("dev1") {
+				t.Fatalf("TxCachePath = %q, want %q", opts.TxCachePath, store.TxCachePath("dev1"))
+			}
+			if opts.TxCacheIndexPath != store.TxCacheIndexPath("dev1") {
+				t.Fatalf("TxCacheIndexPath = %q, want %q", opts.TxCacheIndexPath, store.TxCacheIndexPath("dev1"))
+			}
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("StreamShell was not called")
+	}
+}
+
 func TestShareRecordsVirtualPortsForNamedSession(t *testing.T) {
 	var out bytes.Buffer
 	store := session.Store{Dir: t.TempDir()}
@@ -2782,6 +3408,15 @@ func TestWorkerShareUsesGoBridgeWhenAvailable(t *testing.T) {
 			}
 			if opts.CachePath != store.CachePath("dev1") {
 				t.Fatalf("CachePath = %q, want %q", opts.CachePath, store.CachePath("dev1"))
+			}
+			if opts.TxCachePath != store.TxCachePath("dev1") {
+				t.Fatalf("TxCachePath = %q, want %q", opts.TxCachePath, store.TxCachePath("dev1"))
+			}
+			if opts.TxCacheIndexPath != store.TxCacheIndexPath("dev1") {
+				t.Fatalf("TxCacheIndexPath = %q, want %q", opts.TxCacheIndexPath, store.TxCacheIndexPath("dev1"))
+			}
+			if !reflect.DeepEqual(opts.PublicPorts, []string{"COM20", "COM21"}) {
+				t.Fatalf("PublicPorts = %#v", opts.PublicPorts)
 			}
 			return nil
 		},

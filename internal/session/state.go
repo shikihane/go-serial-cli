@@ -150,6 +150,14 @@ func (s Store) CacheIndexPath(name string) string {
 	return filepath.Join(s.SessionDir(name), "cache.index.jsonl")
 }
 
+func (s Store) TxCachePath(name string) string {
+	return filepath.Join(s.SessionDir(name), "tx.log")
+}
+
+func (s Store) TxCacheIndexPath(name string) string {
+	return filepath.Join(s.SessionDir(name), "tx.index.jsonl")
+}
+
 func (s Store) SessionDir(name string) string {
 	return filepath.Join(s.sessionsRoot(), name)
 }

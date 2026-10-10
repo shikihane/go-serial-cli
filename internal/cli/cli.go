@@ -56,6 +56,7 @@ type AppDeps struct {
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
 	StreamShell           func(opts serialcmd.ShellStreamOptions) error
+	TransferYModem        func(opts serialcmd.YModemOptions) error
 	IsProcessRunning      func(pid int) bool
 	RetrySleep            func(delay time.Duration)
 	Stdin                 io.Reader
@@ -117,6 +118,10 @@ func (a *App) Run(args []string, out io.Writer) error {
 		return a.runClear(args[1:], out)
 	case "shell":
 		return a.runShell(args[1:], out)
+	case "rz":
+		return a.runRZ(args[1:], out)
+	case "sz":
+		return a.runSZ(args[1:], out)
 	case "tee":
 		return a.runTee(args[1:], out)
 	case "tcp":
@@ -209,6 +214,7 @@ func DefaultDeps() (AppDeps, error) {
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
 		StreamShell:           serialcmd.StreamShell,
+		TransferYModem:        serialcmd.TransferYModem,
 		IsProcessRunning:      isProcessRunning,
 		RetrySleep:            time.Sleep,
 		Stdin:                 os.Stdin,
@@ -868,6 +874,119 @@ func (a *App) runShell(args []string, out io.Writer) error {
 		out = wrappedOutput
 	}
 	return a.runShellStream(name, input, out)
+}
+
+func (a *App) runSZ(args []string, out io.Writer) error {
+	if len(args) != 2 {
+		return a.usage("sz <session> <file>")
+	}
+	if a.deps.Store.Dir == "" {
+		_, _ = fmt.Fprintln(out, "ymodem transfer is unavailable")
+		return nil
+	}
+	if _, err := a.sessionForTransfer(args[0]); err != nil {
+		return err
+	}
+	payload, err := os.ReadFile(args[1])
+	if err != nil {
+		return err
+	}
+	return a.transferYModem(args[0], serialcmd.YModemOptions{
+		SendFile: filepath.Base(args[1]),
+		Payload:  payload,
+		Output:   out,
+	})
+}
+
+func (a *App) runRZ(args []string, out io.Writer) error {
+	if len(args) < 1 || len(args) > 2 {
+		return a.usage("rz <session> [local-file]")
+	}
+	if a.deps.Store.Dir == "" {
+		_, _ = fmt.Fprintln(out, "ymodem transfer is unavailable")
+		return nil
+	}
+	if _, err := a.sessionForTransfer(args[0]); err != nil {
+		return err
+	}
+	local := ""
+	if len(args) == 2 {
+		local = args[1]
+	}
+	// The temp file sits next to the target. os.Rename cannot move a file
+	// to another drive, and TEMP is usually on a different one.
+	tmpDir := "."
+	if local != "" {
+		tmpDir = filepath.Dir(local)
+		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+			return err
+		}
+	}
+	file, err := os.CreateTemp(tmpDir, ".sio-rz-*")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer func() {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+	}()
+	var status serialcmd.YModemStatus
+	err = a.transferYModem(args[0], serialcmd.YModemOptions{
+		RecvWriter: file,
+		Output:     out,
+		Status:     &status,
+	})
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if local == "" {
+		// The name comes from the device. Keep only its last element.
+		local = filepath.Base(strings.ReplaceAll(status.Name, "\\", "/"))
+	}
+	if local == "" || local == "." || local == ".." || local == "/" {
+		return errors.New("ymodem receive finished without a file name")
+	}
+	return os.Rename(tmp, local)
+}
+
+func (a *App) sessionForTransfer(name string) (session.State, error) {
+	state, err := a.deps.Store.Load(name)
+	if err != nil {
+		return session.State{}, err
+	}
+	if state.Paused {
+		return session.State{}, a.pausedSessionError()
+	}
+	return state, nil
+}
+
+func (a *App) transferYModem(name string, opts serialcmd.YModemOptions) error {
+	if a.deps.TransferYModem == nil {
+		return errors.New("ymodem transfer is unavailable")
+	}
+	if a.deps.Store.Dir == "" {
+		return errors.New("session store is unavailable")
+	}
+	state, err := a.sessionForTransfer(name)
+	if err != nil {
+		return err
+	}
+	address, ok, err := sessionDialAddress(state)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if state.Status == session.StatusSharing {
+			return a.sharedControlUnavailable()
+		}
+		return fmt.Errorf("session %s has no running worker; run %s open %s <port> -b <baud> first", name, a.commandName(), name)
+	}
+	opts.Address = address
+	return a.deps.TransferYModem(opts)
 }
 
 // runShellStream prefers the shell-specific session stream, which overlays
@@ -2949,6 +3068,8 @@ Usage:
   %[1]s clear <session>
   %[1]s clear --share
   %[1]s shell <session>
+  %[1]s sz <session> <file>
+  %[1]s rz <session> [local-file]
   %[1]s tee <session> <file>
   %[1]s share <session> <virtual-port> [virtual-port...]
   %[1]s tcp <session> <listen-address>

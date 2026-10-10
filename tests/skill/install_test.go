@@ -65,6 +65,8 @@ func TestBundledSkillExplainsOpenStartsSessionWorker(t *testing.T) {
 		"`sio send`, `sio ask`, `sio shell`, and `sio read` then coordinate through that session",
 		"If `sio` is not installed but `gs` is, use `gs` as the legacy alias.",
 		"Exiting shell leaves the background session worker running",
+		"sio sz <session> <file>",
+		"sio rz <session> [local-file]",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bundled skill does not contain %q", want)

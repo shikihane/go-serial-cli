@@ -95,6 +95,11 @@ func (w *timedCacheWriter) WriteChunk(chunk TimedChunk) (int, error) {
 	return n, nil
 }
 
+// chunkWriter keeps a chunk's own timestamp and source when it is written.
+type chunkWriter interface {
+	WriteChunk(chunk TimedChunk) (int, error)
+}
+
 func WriteTimedChunks(w io.Writer, chunks []TimedChunk) (int64, error) {
 	var written int64
 	for _, chunk := range chunks {
@@ -103,7 +108,7 @@ func WriteTimedChunks(w io.Writer, chunks []TimedChunk) (int64, error) {
 		}
 		var n int
 		var err error
-		if timed, ok := w.(*timedCacheWriter); ok {
+		if timed, ok := w.(chunkWriter); ok {
 			n, err = timed.WriteChunk(chunk)
 		} else {
 			n, err = w.Write(chunk.Data)

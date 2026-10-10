@@ -21,6 +21,8 @@ If `sio` is not installed but `gs` is, use `gs` as the legacy alias.
 8. Reset output state when needed: `sio clear dev1`.
 9. Use one foreground or bridge mode only when needed:
    - `sio shell dev1` for foreground interactive access to the running session.
+   - `sio sz dev1 note.bin` to send one local file with YMODEM-CRC after the user starts the device receive command.
+   - `sio rz dev1` to receive one file with YMODEM-CRC after the user starts the device send command.
    - `sio tee dev1 serial.log` for foreground logging to terminal, file, and cache.
    - `sio tcp dev1 :7001` for a background TCP bridge.
    - `sio share dev1 COM20 COM21` for com0com virtual-port sharing.
@@ -55,6 +57,9 @@ sio check dev1 --rewind 2000
 sio check dev1 --from 0 --to checked.log
 sio clear dev1
 sio shell dev1
+sio sz dev1 note.bin
+sio rz dev1
+sio rz dev1 note.bin
 sio tee dev1 serial.log
 sio tcp dev1 :7001
 sio share dev1 COM20 COM21
@@ -169,6 +174,8 @@ Use `sio log dev1` to print `worker.log` for session and share diagnosis.
 When `worker_state` is `stopped`, nothing is appending serial output in the background. Reading the cache is still valid for old logs, but it is not a live device read. If the task needs fresh device output, reopen the session first, for example `sio open dev1 COM3 -b 115200`, before checking the cache again.
 
 ## Long-Running Modes
+
+Use `sio sz <session> <file>` to send one local file, and `sio rz <session> [local-file]` to receive one file. The user enters the device shell command first. They claim exclusive writes on the running session worker first, then send only YMODEM-CRC protocol bytes; other senders are dropped until the transfer ends. Open the session at the device baud with software flow control off.
 
 Use `sio shell dev1` when an agent needs foreground interactive access. It connects to the running session, prints serial output, shows an internal `>>` prompt, and writes submitted lines to the port. Shell history is per session in `history.log`; Up/Down recall history, Left/Right move the cursor for in-line editing, gray completion suggests the first matching device candidate or the most recent matching history entry, and Right at end of line accepts the suggestion. For top-level completion, every Tab keeps the local prefix, discards prior device candidates, and sends only a bare Tab. The following 500 milliseconds of still-visible device output populate an in-memory candidate cache, with the local prompt redrawn only after the capture window. Device candidates are one-shot for the current input line and are discarded on another Tab, suggestion acceptance, or line submission/cancellation. Input containing whitespace uses history completion only. Ctrl+D and other non-editing control keys are forwarded immediately after any pending local prefix, which is then cleared. A standalone Escape is forwarded after a short arrow-sequence disambiguation window. Arrow keys and Backspace remain local editing keys. Exiting shell leaves the background session worker running. One Ctrl+C should send byte `0x03` to the device; a second interrupt shortly after exits the shell.
 

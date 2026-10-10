@@ -30,6 +30,8 @@ that named session.
 
 ```bash
 sio shell dev1
+sio sz dev1 note.bin
+sio rz dev1
 sio tee dev1 serial.log
 sio tcp dev1 :7001
 sio share dev1 COM20 COM21
@@ -454,10 +456,15 @@ cursor; plain `sio read` output stays raw RX bytes. `sio clear` truncates
 
 ```bash
 sio shell dev1
+sio sz dev1 note.bin
+sio rz dev1
+sio rz dev1 note.bin
 sio tee dev1 serial.log
 sio tcp dev1 :7001
 sio share dev1 COM20 COM21
 ```
+
+`sio sz` sends one local file. `sio rz` receives one file. Enter the device shell command first. These commands then write only YMODEM-CRC bytes. Software flow control must stay off.
 
 `sio shell` connects to the running named session in the foreground, prints serial
 output, and writes submitted lines to the port. It shows an internal `>>` prompt,

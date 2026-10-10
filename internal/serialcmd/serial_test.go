@@ -581,6 +581,192 @@ func TestSessionServerWritesClientDataToSerialPort(t *testing.T) {
 	}
 }
 
+func startClaimTestServer(t *testing.T) (string, *memorySerialPort) {
+	t.Helper()
+	address := freeTCPAddress(t)
+	port := newMemorySerialPort()
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunSessionServer(SessionServerOptions{
+			ControlAddress: address,
+			Port:           "COM3",
+			Baud:           3000000,
+			Stop:           stop,
+			OpenPort: func(portName string, baud int) (SerialPort, error) {
+				return port, nil
+			},
+		})
+	}()
+	t.Cleanup(func() { stopSessionServer(t, stop, errCh) })
+	waitForTCPServer(t, address)
+	return address, port
+}
+
+func readClaimAnswer(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	buf := make([]byte, len(ymodemClaimBusy))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := io.ReadAtLeast(conn, buf, len(ymodemClaimOK))
+	if err != nil {
+		t.Fatalf("claim answer: %v", err)
+	}
+	return string(buf[:n])
+}
+
+func TestSessionServerYModemClaimDropsOtherWriters(t *testing.T) {
+	address, port := startClaimTestServer(t)
+
+	shell, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shell.Close()
+	transfer, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := transfer.Write([]byte(ymodemClaimPreamble + "C")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readClaimAnswer(t, transfer); got != ymodemClaimOK {
+		t.Fatalf("claim answer = %q", got)
+	}
+	if got := port.waitWritten(t); got != "C" {
+		t.Fatalf("claim write = %q, want the preamble stripped", got)
+	}
+	if _, err := shell.Write([]byte("log\r")); err != nil {
+		t.Fatal(err)
+	}
+	port.assertNoWrite(t)
+	if _, err := transfer.Write([]byte{0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	if got := port.waitWritten(t); got != "C\x01\x00" {
+		t.Fatalf("exclusive write = %q", got)
+	}
+	_ = transfer.Close()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := shell.Write([]byte("ok\r")); err != nil {
+		t.Fatal(err)
+	}
+	if got := port.waitWritten(t); got != "C\x01\x00ok\r" {
+		t.Fatalf("released write = %q", got)
+	}
+}
+
+func TestSessionServerYModemClaimRoutesOutputToOwner(t *testing.T) {
+	address, port := startClaimTestServer(t)
+
+	shell, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shell.Close()
+	transfer, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transfer.Write([]byte(ymodemClaimPreamble)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readClaimAnswer(t, transfer); got != ymodemClaimOK {
+		t.Fatalf("claim answer = %q", got)
+	}
+
+	port.injectRead("\x06")
+	ack := make([]byte, 1)
+	_ = transfer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(transfer, ack); err != nil || ack[0] != 0x06 {
+		t.Fatalf("owner read = %q, %v", ack, err)
+	}
+
+	// The shell sees no packet bytes, only a notice when it types.
+	if _, err := shell.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	notice := make([]byte, len(ymodemClaimNotice))
+	_ = shell.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(shell, notice); err != nil || string(notice) != ymodemClaimNotice {
+		t.Fatalf("shell read = %q, %v; want only the notice", notice, err)
+	}
+
+	_ = transfer.Close()
+	released := make([]byte, len(ymodemReleaseNotice))
+	if _, err := io.ReadFull(shell, released); err != nil || string(released) != ymodemReleaseNotice {
+		t.Fatalf("shell read = %q, %v; want the release notice", released, err)
+	}
+	port.injectRead("OK")
+	back := make([]byte, 2)
+	if _, err := io.ReadFull(shell, back); err != nil || string(back) != "OK" {
+		t.Fatalf("shell read after release = %q, %v", back, err)
+	}
+}
+
+func TestSessionServerSecondYModemClaimIsBusy(t *testing.T) {
+	address, _ := startClaimTestServer(t)
+
+	first, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := first.Write([]byte(ymodemClaimPreamble)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readClaimAnswer(t, first); got != ymodemClaimOK {
+		t.Fatalf("first claim = %q", got)
+	}
+	second, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if _, err := second.Write([]byte(ymodemClaimPreamble)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readClaimAnswer(t, second); got != ymodemClaimBusy {
+		t.Fatalf("second claim = %q, want busy", got)
+	}
+}
+
+func TestSessionServerControlBytesDoNotClaim(t *testing.T) {
+	// Ctrl+U from sio shell, or a line starting with C, must not lock the
+	// port for everyone else.
+	address, port := startClaimTestServer(t)
+
+	shell, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shell.Close()
+	other, err := dialTCP(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	if _, err := shell.Write([]byte{0x15}); err != nil {
+		t.Fatal(err)
+	}
+	if got := port.waitWritten(t); got != "\x15" {
+		t.Fatalf("shell write = %q", got)
+	}
+	if _, err := shell.Write([]byte("CLEAR\r")); err != nil {
+		t.Fatal(err)
+	}
+	if got := port.waitWritten(t); got != "\x15CLEAR\r" {
+		t.Fatalf("shell write = %q", got)
+	}
+	if _, err := other.Write([]byte("status\r")); err != nil {
+		t.Fatal(err)
+	}
+	if got := port.waitWritten(t); got != "\x15CLEAR\rstatus\r" {
+		t.Fatalf("other write = %q, want it forwarded", got)
+	}
+}
+
 func TestSessionServerCachesAndBroadcastsSerialOutput(t *testing.T) {
 	address := freeTCPAddress(t)
 	cachePath := filepath.Join(t.TempDir(), "cache.log")
@@ -615,7 +801,7 @@ func TestSessionServerCachesAndBroadcastsSerialOutput(t *testing.T) {
 	if string(buf) != "OK\r\n" {
 		t.Fatalf("client read = %q, want OK CRLF", string(buf))
 	}
-	assertFileContent(t, cachePath, "OK\r\n")
+	waitForFileContent(t, cachePath, "OK\r\n")
 }
 
 func TestShareBridgeKeepsPhysicalPortOpenAndReadsAsyncOutput(t *testing.T) {
@@ -1182,6 +1368,10 @@ func (p *memorySerialPort) waitWritten(t *testing.T) string {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for serial write")
 	}
+	return p.takeWritten()
+}
+
+func (p *memorySerialPort) takeWritten() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.written.String()

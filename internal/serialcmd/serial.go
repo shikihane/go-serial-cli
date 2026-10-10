@@ -380,7 +380,7 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 	}
 
 	server := newSessionServer(port, output, txOutput)
-	defer server.closeClients()
+	defer server.close()
 
 	errCh := make(chan error, 3)
 	go func() {
@@ -455,7 +455,7 @@ func RunSessionServer(opts SessionServerOptions) error {
 	defer listener.Close()
 
 	server := newSessionServer(port, output, txOutput)
-	defer server.closeClients()
+	defer server.close()
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -643,11 +643,12 @@ func StreamSession(address string, input io.Reader, output io.Writer) error {
 
 type sessionServer struct {
 	port     SerialPort
-	output   io.Writer
-	txOutput io.Writer
+	output   *asyncCapture
+	txOutput *asyncCapture
 	mu       sync.Mutex
 	writeMu  sync.Mutex
 	clients  map[net.Conn]struct{}
+	claim    portClaim
 }
 
 type shareEndpoint struct {
@@ -666,6 +667,7 @@ type shareBridge struct {
 	mu           sync.Mutex
 	writeMu      sync.Mutex
 	clients      map[net.Conn]struct{}
+	claim        portClaim
 	asyncWG      sync.WaitGroup
 	closeOnce    sync.Once
 }
@@ -676,10 +678,17 @@ func newSessionServer(port SerialPort, output io.Writer, txOutput io.Writer) *se
 	}
 	return &sessionServer{
 		port:     port,
-		output:   output,
-		txOutput: txOutput,
+		output:   newAsyncCapture(output),
+		txOutput: newAsyncCapture(txOutput),
 		clients:  map[net.Conn]struct{}{},
 	}
+}
+
+// close flushes the capture queues. Call it before the cache files close.
+func (s *sessionServer) close() {
+	s.closeClients()
+	s.output.Close()
+	s.txOutput.Close()
 }
 
 func openTxOutput(txCachePath string, txCacheIndexPath string) (io.Writer, func(), error) {
@@ -690,8 +699,7 @@ func openTxOutput(txCachePath string, txCacheIndexPath string) (io.Writer, func(
 	return OpenTimedCacheWriter(txCachePath, indexPath)
 }
 
-func captureTXChunk(txOutput io.Writer, source string, data []byte) error {
-	chunk := TimedChunk{At: time.Now().Local(), Source: source, Data: data}
+func captureTXChunk(txOutput io.Writer, chunk TimedChunk) error {
 	if _, err := WriteTimedChunks(txOutput, []TimedChunk{chunk}); err != nil {
 		return fmt.Errorf("write tx capture: %w", err)
 	}
@@ -766,6 +774,7 @@ func (b *shareBridge) removeClient(conn net.Conn) {
 	b.mu.Lock()
 	delete(b.clients, conn)
 	b.mu.Unlock()
+	b.claim.release(conn)
 	_ = conn.Close()
 }
 
@@ -786,20 +795,31 @@ func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
 	defer b.removeClient(conn)
 	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
+	forward := func(data []byte) error {
+		// Writes are dropped while another connection holds a YMODEM claim.
+		if len(data) == 0 || !b.claim.allows(conn) {
+			return nil
+		}
+		if writeErr := b.writePhysical(data); writeErr != nil {
+			return writeErr
+		}
+		return b.captureTX(label, data)
+	}
+
+	data, claimed, err := readClaim(conn, buf)
+	if claimed && !answerClaim(&b.claim, conn) {
+		return nil
+	}
 	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			data := append([]byte(nil), buf[:n]...)
-			if writeErr := b.writePhysical(data); writeErr != nil {
-				return writeErr
-			}
-			if captureErr := b.captureTX(label, data); captureErr != nil {
-				return captureErr
-			}
+		if fwdErr := forward(append([]byte(nil), data...)); fwdErr != nil {
+			return fwdErr
 		}
 		if err != nil {
 			return normalizeCopyError(err)
 		}
+		var n int
+		n, err = conn.Read(buf)
+		data = buf[:n]
 	}
 }
 
@@ -823,6 +843,10 @@ func (b *shareBridge) copyEndpointToOthers(source shareEndpoint) error {
 }
 
 func (b *shareBridge) routeEndpointData(source shareEndpoint, data []byte) error {
+	// A shared virtual port never holds a claim, so a transfer silences it.
+	if !b.claim.allows(nil) {
+		return nil
+	}
 	if err := b.writePhysical(data); err != nil {
 		return err
 	}
@@ -830,7 +854,7 @@ func (b *shareBridge) routeEndpointData(source shareEndpoint, data []byte) error
 }
 
 func (b *shareBridge) captureTX(source string, data []byte) error {
-	return captureTXChunk(b.txOutput, source, data)
+	return captureTXChunk(b.txOutput, TimedChunk{At: time.Now().Local(), Source: source, Data: data})
 }
 
 func (b *shareBridge) writePhysical(data []byte) error {
@@ -924,6 +948,7 @@ func (s *sessionServer) removeClient(conn net.Conn) {
 	s.mu.Lock()
 	delete(s.clients, conn)
 	s.mu.Unlock()
+	s.claim.release(conn)
 	_ = conn.Close()
 }
 
@@ -940,27 +965,74 @@ func (s *sessionServer) closeClients() {
 	}
 }
 
+func writeSerialAll(s *sessionServer, data []byte) error {
+	for len(data) > 0 {
+		s.writeMu.Lock()
+		n, err := s.port.Write(data)
+		s.writeMu.Unlock()
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errors.New("serial port accepted no bytes")
+		}
+	}
+	return nil
+}
+
 func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
-	defer s.removeClient(conn)
+	claimed := false
+	// Release the claim before telling the others it is over.
+	defer func() {
+		s.removeClient(conn)
+		if claimed {
+			s.noticeOthers(conn, ymodemReleaseNotice)
+		}
+	}()
 	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
+	warned := false
+	forward := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		// Writes are dropped while another connection holds a YMODEM
+		// claim. Say so once, so the user knows why keys do nothing.
+		if !s.claim.allows(conn) {
+			if !warned {
+				warned = true
+				_, _ = conn.Write([]byte(ymodemClaimNotice))
+			}
+			return nil
+		}
+		warned = false
+		at := time.Now().Local()
+		if writeErr := writeSerialAll(s, data); writeErr != nil {
+			return fmt.Errorf("write serial port %s: %w", portName, writeErr)
+		}
+		return captureTXChunk(s.txOutput, TimedChunk{At: at, Source: label, Data: data})
+	}
+
+	data, wantClaim, err := readClaim(conn, buf)
+	if wantClaim {
+		if !answerClaim(&s.claim, conn) {
+			return nil
+		}
+		claimed = true
+	}
 	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			data := append([]byte(nil), buf[:n]...)
-			s.writeMu.Lock()
-			_, writeErr := s.port.Write(data)
-			s.writeMu.Unlock()
-			if writeErr != nil {
-				return fmt.Errorf("write serial port %s: %w", portName, writeErr)
-			}
-			if captureErr := captureTXChunk(s.txOutput, label, data); captureErr != nil {
-				return captureErr
-			}
+		if fwdErr := forward(append([]byte(nil), data...)); fwdErr != nil {
+			return fwdErr
 		}
 		if err != nil {
 			return normalizeCopyError(err)
 		}
+		var n int
+		n, err = conn.Read(buf)
+		data = buf[:n]
 	}
 }
 
@@ -970,10 +1042,12 @@ func (s *sessionServer) copyPortToClients(portName string) error {
 		n, err := s.port.Read(buf)
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
-			if _, writeErr := s.output.Write(data); writeErr != nil {
+			at := time.Now().Local()
+			// Forward before logging: a transfer waits on each ACK.
+			s.broadcast(data)
+			if _, writeErr := s.output.WriteChunk(TimedChunk{At: at, Data: data}); writeErr != nil {
 				return writeErr
 			}
-			s.broadcast(data)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -984,7 +1058,16 @@ func (s *sessionServer) copyPortToClients(portName string) error {
 	}
 }
 
+// broadcast sends serial output to the clients. During a YMODEM claim only
+// the owner gets it: the others would print raw packets, and each extra
+// write delays the ACK the transfer is waiting for.
 func (s *sessionServer) broadcast(data []byte) {
+	if owner := s.claim.current(); owner != nil {
+		if _, err := owner.Write(data); err != nil {
+			s.removeClient(owner)
+		}
+		return
+	}
 	s.mu.Lock()
 	clients := make([]net.Conn, 0, len(s.clients))
 	for conn := range s.clients {
@@ -995,6 +1078,21 @@ func (s *sessionServer) broadcast(data []byte) {
 		if _, err := conn.Write(data); err != nil {
 			s.removeClient(conn)
 		}
+	}
+}
+
+// noticeOthers writes a line to every client but skip.
+func (s *sessionServer) noticeOthers(skip net.Conn, text string) {
+	s.mu.Lock()
+	clients := make([]net.Conn, 0, len(s.clients))
+	for conn := range s.clients {
+		if conn != skip {
+			clients = append(clients, conn)
+		}
+	}
+	s.mu.Unlock()
+	for _, conn := range clients {
+		_, _ = conn.Write([]byte(text))
 	}
 }
 

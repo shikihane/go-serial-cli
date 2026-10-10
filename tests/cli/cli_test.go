@@ -195,6 +195,8 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"sio ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]",
 		"sio read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]",
 		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
+		"sio sz <session> <file>",
+		"sio rz <session> [local-file]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help output %q does not contain %q", got, want)
@@ -259,6 +261,8 @@ func TestTopLevelCommandsAreRecognized(t *testing.T) {
 		{"check", "dev1", "-n", "200"},
 		{"clear", "dev1"},
 		{"shell", "dev1"},
+		{"sz", "dev1", "note.bin"},
+		{"rz", "dev1"},
 		{"tee", "dev1", "serial.log"},
 		{"tcp", "dev1", ":7001"},
 		{"share", "dev1", "COM20", "COM21"},
@@ -2074,6 +2078,179 @@ func TestSendRejectsSharedSessionWithoutControlChannel(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "shared session control channel is unavailable") {
 		t.Fatalf("error = %v, want shared control error", err)
+	}
+}
+
+func TestRZUsesSessionControlAndDoesNotOpenPort(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	local := filepath.Join(t.TempDir(), "note.bin")
+	if err := os.WriteFile(local, []byte("abcd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var got serialcmd.YModemOptions
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		TransferYModem: func(opts serialcmd.YModemOptions) error {
+			got = opts
+			_, _ = fmt.Fprintln(opts.Output, "ok note.bin 4")
+			return nil
+		},
+		SendSerial: func(port string, baud int, data string) error {
+			t.Fatal("sz must not open the physical port")
+			return nil
+		},
+	})
+	if err := app.Run([]string{"sz", "dev1", local}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got.Address != "127.0.0.1:7002" || got.Command != "" || got.SendFile != "note.bin" {
+		t.Fatalf("options = %#v", got)
+	}
+	if !bytes.Equal(got.Payload, []byte("abcd")) {
+		t.Fatalf("payload = %q", got.Payload)
+	}
+	if !strings.Contains(out.String(), "ok note.bin 4") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestRZUsesSessionControlAndWritesLocalFile(t *testing.T) {
+	var out bytes.Buffer
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	local := filepath.Join(t.TempDir(), "out", "note.bin")
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		TransferYModem: func(opts serialcmd.YModemOptions) error {
+			if opts.Address != "127.0.0.1:7002" || opts.Command != "" || opts.SendFile != "" || opts.Payload != nil {
+				t.Fatalf("options = %#v", opts)
+			}
+			if opts.RecvWriter == nil {
+				t.Fatal("missing receive writer")
+			}
+			if opts.Status != nil {
+				opts.Status.Name = "note.bin"
+			}
+			_, _ = opts.RecvWriter.Write([]byte("hello"))
+			_, _ = fmt.Fprintln(opts.Output, "ok note.bin 5")
+			return nil
+		},
+	})
+	if err := app.Run([]string{"rz", "dev1", local}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	got, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestSZSendsLocalFileWithoutWritingShellCommand(t *testing.T) {
+	dir := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.WriteFile("README.md", []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatal(err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		TransferYModem: func(opts serialcmd.YModemOptions) error {
+			if opts.Command != "" || opts.RecvWriter != nil {
+				t.Fatalf("options = %#v", opts)
+			}
+			if !bytes.Equal(opts.Payload, []byte("keep")) || opts.SendFile != "README.md" {
+				t.Fatalf("payload = %q name = %q", opts.Payload, opts.SendFile)
+			}
+			return nil
+		},
+	})
+	if err := app.Run([]string{"sz", "dev", "README.md"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("file = %q, want keep", got)
+	}
+}
+
+func TestRZUsesBlock0NameWhenLocalNameOmitted(t *testing.T) {
+	dir := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatal(err)
+	}
+	app := cli.New(cli.AppDeps{
+		Store: store,
+		TransferYModem: func(opts serialcmd.YModemOptions) error {
+			if opts.Command != "" || opts.Payload != nil {
+				t.Fatalf("options = %#v", opts)
+			}
+			if opts.Status != nil {
+				opts.Status.Name = "README.md"
+			}
+			_, _ = opts.RecvWriter.Write([]byte("hello"))
+			return nil
+		},
+	})
+	if err := app.Run([]string{"rz", "dev"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestRZRejectsPausedSession(t *testing.T) {
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, Paused: true, ControlAddress: "127.0.0.1:7002"}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	app := cli.New(cli.AppDeps{Store: store, TransferYModem: func(opts serialcmd.YModemOptions) error {
+		t.Fatal("paused session should not transfer")
+		return nil
+	}})
+	err := app.Run([]string{"sz", "dev1", "note.bin"}, io.Discard)
+	if err == nil || !errors.Is(err, cli.ErrSessionPaused) {
+		t.Fatalf("err = %v, want paused", err)
 	}
 }
 

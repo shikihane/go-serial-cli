@@ -2,6 +2,7 @@ package serialcmd
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -294,7 +295,8 @@ func TestAskWritesPayloadAndCopiesLastResponseLinesToOutputAndCache(t *testing.T
 			CachePath: cachePath,
 			OpenPort: func(portName string, baud int) (SerialPort, error) {
 				if portName != "COM3" || baud != 115200 {
-					t.Fatalf("open args = %q %d", portName, baud)
+					t.Errorf("open args = %q %d", portName, baud)
+					return nil, errors.New("unexpected open")
 				}
 				return port, nil
 			},
@@ -454,7 +456,8 @@ func TestBridgeTCPMovesDataBetweenClientAndSerialPort(t *testing.T) {
 			AcceptOne:     true,
 			OpenPort: func(portName string, baud int) (SerialPort, error) {
 				if portName != "COM3" || baud != 115200 {
-					t.Fatalf("open args = %q %d", portName, baud)
+					t.Errorf("open args = %q %d", portName, baud)
+					return nil, errors.New("unexpected open")
 				}
 				return port, nil
 			},
@@ -564,7 +567,8 @@ func TestSessionServerWritesClientDataToSerialPort(t *testing.T) {
 			Stop:           stop,
 			OpenPort: func(portName string, baud int) (SerialPort, error) {
 				if portName != "COM3" || baud != 115200 {
-					t.Fatalf("open args = %q %d", portName, baud)
+					t.Errorf("open args = %q %d", portName, baud)
+					return nil, errors.New("unexpected open")
 				}
 				return port, nil
 			},
@@ -605,16 +609,16 @@ func startClaimTestServer(t *testing.T) (string, *memorySerialPort) {
 
 func readClaimAnswer(t *testing.T, conn net.Conn) string {
 	t.Helper()
-	buf := make([]byte, len(ymodemClaimBusy))
+	buf := make([]byte, len(transferClaimBusy))
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := io.ReadAtLeast(conn, buf, len(ymodemClaimOK))
+	n, err := io.ReadAtLeast(conn, buf, len(transferClaimOK))
 	if err != nil {
 		t.Fatalf("claim answer: %v", err)
 	}
 	return string(buf[:n])
 }
 
-func TestSessionServerYModemClaimDropsOtherWriters(t *testing.T) {
+func TestSessionServerTransferClaimDropsOtherWriters(t *testing.T) {
 	address, port := startClaimTestServer(t)
 
 	shell, err := dialTCP(address)
@@ -627,10 +631,10 @@ func TestSessionServerYModemClaimDropsOtherWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := transfer.Write([]byte(ymodemClaimPreamble + "C")); err != nil {
+	if _, err := transfer.Write([]byte(transferClaimPreamble + "C")); err != nil {
 		t.Fatal(err)
 	}
-	if got := readClaimAnswer(t, transfer); got != ymodemClaimOK {
+	if got := readClaimAnswer(t, transfer); got != transferClaimOK {
 		t.Fatalf("claim answer = %q", got)
 	}
 	if got := port.waitWritten(t); got != "C" {
@@ -656,7 +660,7 @@ func TestSessionServerYModemClaimDropsOtherWriters(t *testing.T) {
 	}
 }
 
-func TestSessionServerYModemClaimRoutesOutputToOwner(t *testing.T) {
+func TestSessionServerTransferClaimRoutesOutputToOwner(t *testing.T) {
 	address, port := startClaimTestServer(t)
 
 	shell, err := dialTCP(address)
@@ -668,10 +672,10 @@ func TestSessionServerYModemClaimRoutesOutputToOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transfer.Write([]byte(ymodemClaimPreamble)); err != nil {
+	if _, err := transfer.Write([]byte(transferClaimPreamble)); err != nil {
 		t.Fatal(err)
 	}
-	if got := readClaimAnswer(t, transfer); got != ymodemClaimOK {
+	if got := readClaimAnswer(t, transfer); got != transferClaimOK {
 		t.Fatalf("claim answer = %q", got)
 	}
 
@@ -686,15 +690,15 @@ func TestSessionServerYModemClaimRoutesOutputToOwner(t *testing.T) {
 	if _, err := shell.Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	notice := make([]byte, len(ymodemClaimNotice))
+	notice := make([]byte, len(transferClaimNotice))
 	_ = shell.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := io.ReadFull(shell, notice); err != nil || string(notice) != ymodemClaimNotice {
+	if _, err := io.ReadFull(shell, notice); err != nil || string(notice) != transferClaimNotice {
 		t.Fatalf("shell read = %q, %v; want only the notice", notice, err)
 	}
 
 	_ = transfer.Close()
-	released := make([]byte, len(ymodemReleaseNotice))
-	if _, err := io.ReadFull(shell, released); err != nil || string(released) != ymodemReleaseNotice {
+	released := make([]byte, len(transferReleaseNotice))
+	if _, err := io.ReadFull(shell, released); err != nil || string(released) != transferReleaseNotice {
 		t.Fatalf("shell read = %q, %v; want the release notice", released, err)
 	}
 	port.injectRead("OK")
@@ -704,7 +708,7 @@ func TestSessionServerYModemClaimRoutesOutputToOwner(t *testing.T) {
 	}
 }
 
-func TestSessionServerSecondYModemClaimIsBusy(t *testing.T) {
+func TestSessionServerSecondTransferClaimIsBusy(t *testing.T) {
 	address, _ := startClaimTestServer(t)
 
 	first, err := dialTCP(address)
@@ -712,10 +716,10 @@ func TestSessionServerSecondYModemClaimIsBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	if _, err := first.Write([]byte(ymodemClaimPreamble)); err != nil {
+	if _, err := first.Write([]byte(transferClaimPreamble)); err != nil {
 		t.Fatal(err)
 	}
-	if got := readClaimAnswer(t, first); got != ymodemClaimOK {
+	if got := readClaimAnswer(t, first); got != transferClaimOK {
 		t.Fatalf("first claim = %q", got)
 	}
 	second, err := dialTCP(address)
@@ -723,10 +727,10 @@ func TestSessionServerSecondYModemClaimIsBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	if _, err := second.Write([]byte(ymodemClaimPreamble)); err != nil {
+	if _, err := second.Write([]byte(transferClaimPreamble)); err != nil {
 		t.Fatal(err)
 	}
-	if got := readClaimAnswer(t, second); got != ymodemClaimBusy {
+	if got := readClaimAnswer(t, second); got != transferClaimBusy {
 		t.Fatalf("second claim = %q, want busy", got)
 	}
 }
@@ -793,8 +797,12 @@ func TestSessionServerCachesAndBroadcastsSerialOutput(t *testing.T) {
 	}
 	defer client.Close()
 
+	// The server registers a client just after accepting it; output read
+	// before then reaches no one.
+	time.Sleep(100 * time.Millisecond)
 	port.injectRead("OK\r\n")
 	buf := make([]byte, 4)
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.ReadFull(client, buf); err != nil {
 		t.Fatalf("client Read returned error: %v", err)
 	}
@@ -826,8 +834,8 @@ func TestShareBridgeKeepsPhysicalPortOpenAndReadsAsyncOutput(t *testing.T) {
 				if portName == "CNCB20" {
 					return hubA, nil
 				}
-				t.Fatalf("unexpected port open %s", portName)
-				return nil, nil
+				t.Errorf("unexpected port open %s", portName)
+				return nil, errors.New("unexpected open")
 			},
 		})
 	}()

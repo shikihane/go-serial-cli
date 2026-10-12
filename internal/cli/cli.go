@@ -56,7 +56,7 @@ type AppDeps struct {
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
 	StreamShell           func(opts serialcmd.ShellStreamOptions) error
-	TransferYModem        func(opts serialcmd.YModemOptions) error
+	TransferZModem        func(opts serialcmd.ZModemOptions) error
 	IsProcessRunning      func(pid int) bool
 	RetrySleep            func(delay time.Duration)
 	Stdin                 io.Reader
@@ -214,7 +214,7 @@ func DefaultDeps() (AppDeps, error) {
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
 		StreamShell:           serialcmd.StreamShell,
-		TransferYModem:        serialcmd.TransferYModem,
+		TransferZModem:        serialcmd.TransferZModem,
 		IsProcessRunning:      isProcessRunning,
 		RetrySleep:            time.Sleep,
 		Stdin:                 os.Stdin,
@@ -843,6 +843,316 @@ func teeOutput(out io.Writer, path string) (io.Writer, func(), error) {
 	}, nil
 }
 
+// Exit codes of sio sz and sio rz. The last output line names the outcome
+// too: "result: ok", "result: skipped" (identical already there),
+// "result: resumed", "result: cancelled", "result: refused" (the
+// receiver kept its existing file), "result: partial: <files>" (a batch
+// where some files did not go through) or "result: failed: <reason>".
+const (
+	ExitTransferFailed    = 1
+	ExitTransferSkipped   = 3
+	ExitTransferResumed   = 4
+	ExitTransferCancelled = 5
+	ExitTransferRefused   = 6
+	ExitTransferPartial   = 7
+)
+
+// ExitError carries a process exit code. Its outcome line is already
+// printed; Err, when set, is the reason.
+type ExitError struct {
+	Code int
+	Err  error
+}
+
+func (e *ExitError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exit status %d", e.Code)
+	}
+	return e.Err.Error()
+}
+
+func (e *ExitError) Unwrap() error { return e.Err }
+
+type transferFlags struct {
+	conflict serialcmd.ConflictPolicy
+	window   int
+	escape   bool
+	noResume bool
+	wait     time.Duration
+}
+
+func parseTransferFlags(args []string) ([]string, transferFlags, error) {
+	// conflict stays empty unless given: an explicit policy overrides the
+	// management option the device puts in ZF1.
+	var flags transferFlags
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		value := func() (string, error) {
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("%s needs a value", arg)
+			}
+			i++
+			return args[i], nil
+		}
+		switch arg {
+		case "--conflict":
+			v, err := value()
+			if err != nil {
+				return nil, flags, err
+			}
+			p, err := serialcmd.ParseConflictPolicy(v)
+			if err != nil {
+				return nil, flags, err
+			}
+			flags.conflict = p
+		case "--window":
+			v, err := value()
+			if err != nil {
+				return nil, flags, err
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1024 {
+				return nil, flags, fmt.Errorf("--window must be at least 1024 bytes, got %q", v)
+			}
+			flags.window = n
+		case "-t":
+			v, err := value()
+			if err != nil {
+				return nil, flags, err
+			}
+			secs, err := strconv.ParseFloat(v, 64)
+			if err != nil || secs <= 0 {
+				return nil, flags, fmt.Errorf("-t must be a positive number of seconds, got %q", v)
+			}
+			flags.wait = time.Duration(secs * float64(time.Second))
+		case "--escape":
+			flags.escape = true
+		case "--no-resume":
+			flags.noResume = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return nil, flags, fmt.Errorf("unknown option %s", arg)
+			}
+			rest = append(rest, arg)
+		}
+	}
+	return rest, flags, nil
+}
+
+const (
+	szUsage = "sz <session> <file>... [--conflict skip-identical-else-rename|overwrite|skip|rename] [--window bytes] [--no-resume] [--escape] [-t seconds]"
+	rzUsage = "rz <session> [dest] [--conflict skip-identical-else-rename|overwrite|skip|rename] [--escape] [-t seconds]"
+)
+
+func (a *App) runSZ(args []string, out io.Writer) error {
+	rest, flags, err := parseTransferFlags(args)
+	if err != nil {
+		return fmt.Errorf("%v; %w", err, a.usage(szUsage))
+	}
+	if len(rest) < 2 {
+		return a.usage(szUsage)
+	}
+	if a.deps.Store.Dir == "" {
+		_, _ = fmt.Fprintln(out, "zmodem transfer is unavailable")
+		return nil
+	}
+	if _, err := a.sessionForTransfer(rest[0]); err != nil {
+		return err
+	}
+	if flags.conflict != "" {
+		// ZF1 is only a request; rz ignores it and refuses an existing
+		// name unless run as rz -o (overwrite) or -n (rename).
+		_, _ = fmt.Fprintf(out, "zmodem: --conflict %s is a request the receiver may ignore; on the device use rz -o (overwrite) or -n (rename)\n", flags.conflict)
+	}
+	var files []serialcmd.ZSendFile
+	for _, path := range rest[1:] {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory; sz sends files only", path)
+		}
+		files = append(files, serialcmd.ZSendFile{Path: path})
+	}
+	return a.transferZModem(rest[0], serialcmd.ZModemOptions{
+		Files:         files,
+		Conflict:      flags.conflict,
+		Window:        flags.window,
+		EscapeCtl:     flags.escape,
+		NoResume:      flags.noResume,
+		HandshakeWait: flags.wait,
+	}, out)
+}
+
+// runRZ receives into dest. A folder (existing, or ending in a separator)
+// takes every file under its own name; otherwise dest names the first file
+// and later ones go next to it.
+func (a *App) runRZ(args []string, out io.Writer) error {
+	rest, flags, err := parseTransferFlags(args)
+	if err != nil {
+		return fmt.Errorf("%v; %w", err, a.usage(rzUsage))
+	}
+	if len(rest) < 1 || len(rest) > 2 || flags.window != 0 || flags.noResume {
+		return a.usage(rzUsage)
+	}
+	opts := serialcmd.ZModemOptions{
+		Receive:       true,
+		DestDir:       ".",
+		Conflict:      flags.conflict,
+		EscapeCtl:     flags.escape,
+		HandshakeWait: flags.wait,
+	}
+	if len(rest) == 2 {
+		dest := rest[1]
+		info, statErr := os.Stat(dest)
+		if (statErr == nil && info.IsDir()) || strings.HasSuffix(dest, "/") || strings.HasSuffix(dest, `\`) {
+			opts.DestDir = dest
+		} else {
+			opts.DestDir = filepath.Dir(dest)
+			opts.DestPath = dest
+		}
+	}
+	if a.deps.Store.Dir == "" {
+		_, _ = fmt.Fprintln(out, "zmodem transfer is unavailable")
+		return nil
+	}
+	if _, err := a.sessionForTransfer(rest[0]); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(opts.DestDir, 0o755); err != nil {
+		return err
+	}
+	return a.transferZModem(rest[0], opts, out)
+}
+
+func (a *App) sessionForTransfer(name string) (session.State, error) {
+	state, err := a.deps.Store.Load(name)
+	if err != nil {
+		return session.State{}, err
+	}
+	if state.Paused {
+		return session.State{}, a.pausedSessionError()
+	}
+	return state, nil
+}
+
+func (a *App) transferZModem(name string, opts serialcmd.ZModemOptions, out io.Writer) error {
+	if a.deps.TransferZModem == nil {
+		return errors.New("zmodem transfer is unavailable")
+	}
+	if a.deps.Store.Dir == "" {
+		return errors.New("session store is unavailable")
+	}
+	state, err := a.sessionForTransfer(name)
+	if err != nil {
+		return err
+	}
+	address, ok, err := sessionDialAddress(state)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if state.Status == session.StatusSharing {
+			return a.sharedControlUnavailable()
+		}
+		return fmt.Errorf("session %s has no running worker; run %s open %s <port> -b <baud> first", name, a.commandName(), name)
+	}
+	var result serialcmd.ZModemResult
+	opts.Address = address
+	opts.Output = out
+	opts.Result = &result
+	opts.ProgressInline = isConsoleOutput(out)
+	if opts.Cancel == nil {
+		// The first Ctrl+C cancels; a second one also stops waiting for
+		// the device's result line.
+		cancel, force := make(chan struct{}), make(chan struct{})
+		stop := onInterrupts(cancel, force)
+		defer stop()
+		opts.Cancel, opts.Force = cancel, force
+	}
+	if opts.Receive {
+		_, _ = fmt.Fprintln(out, "zmodem: waiting for the device to send (sz <file> on the device); Ctrl+C cancels")
+	} else {
+		_, _ = fmt.Fprintln(out, "zmodem: waiting for the device to receive (rz on the device); Ctrl+C cancels")
+	}
+	err = a.deps.TransferZModem(opts)
+	return transferExit(out, result.Outcome, err)
+}
+
+// transferExit prints the last line and maps the outcome to an exit code.
+func transferExit(out io.Writer, outcome string, err error) error {
+	if outcome == "" {
+		switch {
+		case errors.Is(err, serialcmd.ErrTransferCancelled):
+			outcome = serialcmd.OutcomeCancelled
+		case err != nil:
+			outcome = serialcmd.OutcomeFailed
+		default:
+			outcome = serialcmd.OutcomeOK
+		}
+	}
+	switch {
+	case outcome == serialcmd.OutcomeOK && err == nil:
+		_, _ = fmt.Fprintln(out, "result: ok")
+		return nil
+	case outcome == serialcmd.OutcomeSkipped && err == nil:
+		_, _ = fmt.Fprintln(out, "result: skipped")
+		return &ExitError{Code: ExitTransferSkipped}
+	case outcome == serialcmd.OutcomeResumed && err == nil:
+		_, _ = fmt.Fprintln(out, "result: resumed")
+		return &ExitError{Code: ExitTransferResumed}
+	case outcome == serialcmd.OutcomeCancelled:
+		_, _ = fmt.Fprintln(out, "result: cancelled")
+		return &ExitError{Code: ExitTransferCancelled}
+	case outcome == serialcmd.OutcomeRefused:
+		_, _ = fmt.Fprintln(out, "result: refused")
+		return &ExitError{Code: ExitTransferRefused}
+	case outcome == serialcmd.OutcomePartial:
+		_, _ = fmt.Fprintf(out, "result: partial: %v\n", err)
+		return &ExitError{Code: ExitTransferPartial}
+	}
+	if err == nil {
+		err = errors.New("transfer failed")
+	}
+	_, _ = fmt.Fprintf(out, "result: failed: %v\n", err)
+	return &ExitError{Code: ExitTransferFailed}
+}
+
+// onInterrupts closes cancel on the first Ctrl+C and force on the next
+// one, until stop is called.
+func onInterrupts(cancel, force chan struct{}) (stop func()) {
+	ch := make(chan os.Signal, 2)
+	signal.Notify(ch, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		for _, c := range []chan struct{}{cancel, force} {
+			select {
+			case <-ch:
+				close(c)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(done)
+	}
+}
+
+// isConsoleOutput reports whether out is a terminal, where the progress
+// line can be redrawn in place.
+func isConsoleOutput(out io.Writer) bool {
+	f, ok := out.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
 func (a *App) runShell(args []string, out io.Writer) error {
 	if len(args) != 1 {
 		return a.usage("shell <session>")
@@ -876,122 +1186,6 @@ func (a *App) runShell(args []string, out io.Writer) error {
 	return a.runShellStream(name, input, out)
 }
 
-func (a *App) runSZ(args []string, out io.Writer) error {
-	if len(args) != 2 {
-		return a.usage("sz <session> <file>")
-	}
-	if a.deps.Store.Dir == "" {
-		_, _ = fmt.Fprintln(out, "ymodem transfer is unavailable")
-		return nil
-	}
-	if _, err := a.sessionForTransfer(args[0]); err != nil {
-		return err
-	}
-	payload, err := os.ReadFile(args[1])
-	if err != nil {
-		return err
-	}
-	return a.transferYModem(args[0], serialcmd.YModemOptions{
-		SendFile: filepath.Base(args[1]),
-		Payload:  payload,
-		Output:   out,
-	})
-}
-
-func (a *App) runRZ(args []string, out io.Writer) error {
-	if len(args) < 1 || len(args) > 2 {
-		return a.usage("rz <session> [local-file]")
-	}
-	if a.deps.Store.Dir == "" {
-		_, _ = fmt.Fprintln(out, "ymodem transfer is unavailable")
-		return nil
-	}
-	if _, err := a.sessionForTransfer(args[0]); err != nil {
-		return err
-	}
-	local := ""
-	if len(args) == 2 {
-		local = args[1]
-	}
-	// The temp file sits next to the target. os.Rename cannot move a file
-	// to another drive, and TEMP is usually on a different one.
-	tmpDir := "."
-	if local != "" {
-		tmpDir = filepath.Dir(local)
-		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-			return err
-		}
-	}
-	file, err := os.CreateTemp(tmpDir, ".sio-rz-*")
-	if err != nil {
-		return err
-	}
-	tmp := file.Name()
-	defer func() {
-		_ = file.Close()
-		_ = os.Remove(tmp)
-	}()
-	var status serialcmd.YModemStatus
-	err = a.transferYModem(args[0], serialcmd.YModemOptions{
-		RecvWriter: file,
-		Output:     out,
-		Status:     &status,
-	})
-	if err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if local == "" {
-		// The name comes from the device. Keep only its last element.
-		local = filepath.Base(strings.ReplaceAll(status.Name, "\\", "/"))
-	}
-	if local == "" || local == "." || local == ".." || local == "/" {
-		return errors.New("ymodem receive finished without a file name")
-	}
-	return os.Rename(tmp, local)
-}
-
-func (a *App) sessionForTransfer(name string) (session.State, error) {
-	state, err := a.deps.Store.Load(name)
-	if err != nil {
-		return session.State{}, err
-	}
-	if state.Paused {
-		return session.State{}, a.pausedSessionError()
-	}
-	return state, nil
-}
-
-func (a *App) transferYModem(name string, opts serialcmd.YModemOptions) error {
-	if a.deps.TransferYModem == nil {
-		return errors.New("ymodem transfer is unavailable")
-	}
-	if a.deps.Store.Dir == "" {
-		return errors.New("session store is unavailable")
-	}
-	state, err := a.sessionForTransfer(name)
-	if err != nil {
-		return err
-	}
-	address, ok, err := sessionDialAddress(state)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		if state.Status == session.StatusSharing {
-			return a.sharedControlUnavailable()
-		}
-		return fmt.Errorf("session %s has no running worker; run %s open %s <port> -b <baud> first", name, a.commandName(), name)
-	}
-	opts.Address = address
-	return a.deps.TransferYModem(opts)
-}
-
-// runShellStream prefers the shell-specific session stream, which overlays
-// other senders' captured TX as tagged lines. It falls back to the generic
-// stream when no worker control channel or shell streamer is available.
 func (a *App) runShellStream(name string, input io.Reader, out io.Writer) error {
 	if a.deps.Store.Dir != "" && a.deps.StreamShell != nil {
 		state, err := a.deps.Store.Load(name)
@@ -3068,8 +3262,8 @@ Usage:
   %[1]s clear <session>
   %[1]s clear --share
   %[1]s shell <session>
-  %[1]s sz <session> <file>
-  %[1]s rz <session> [local-file]
+  %[1]s sz <session> <file>... [--conflict policy] [--window bytes] [--no-resume] [--escape] [-t seconds]
+  %[1]s rz <session> [dest] [--conflict policy] [--escape] [-t seconds]
   %[1]s tee <session> <file>
   %[1]s share <session> <virtual-port> [virtual-port...]
   %[1]s tcp <session> <listen-address>

@@ -6,20 +6,20 @@ import (
 	"sync"
 )
 
-// A YMODEM transfer declares itself by sending ymodemClaimPreamble as the
+// A file transfer declares itself by sending transferClaimPreamble as the
 // first bytes on a control connection. The worker strips the preamble and
-// answers that connection alone with ymodemClaimOK or ymodemClaimBusy, in
+// answers that connection alone with transferClaimOK or transferClaimBusy, in
 // line with the serial output it already streams. While a claim is held,
 // writes from every other source are dropped and serial output goes to the
 // owner only. The claim ends when the owning connection closes.
 const (
-	ymodemClaimPreamble = "\x00sio:ymodem-claim\x00"
-	ymodemClaimOK       = "\x00sio:ymodem-ok\x00"
-	ymodemClaimBusy     = "\x00sio:ymodem-busy\x00"
+	transferClaimPreamble = "\x00sio:transfer-claim\x00"
+	transferClaimOK       = "\x00sio:transfer-ok\x00"
+	transferClaimBusy     = "\x00sio:transfer-busy\x00"
 
 	// Plain text for the other clients of a claimed session.
-	ymodemClaimNotice   = "\r\n[sio: ymodem transfer in progress, input dropped]\r\n"
-	ymodemReleaseNotice = "\r\n[sio: ymodem transfer ended]\r\n"
+	transferClaimNotice   = "\r\n[sio: file transfer in progress, input dropped]\r\n"
+	transferReleaseNotice = "\r\n[sio: file transfer ended]\r\n"
 )
 
 // portClaim records the one control connection allowed to write during a
@@ -67,7 +67,7 @@ func (c *portClaim) allows(conn net.Conn) bool {
 // client is forwarded after its first read. It returns the bytes to forward
 // and whether the client sent the preamble.
 func readClaim(conn net.Conn, buf []byte) ([]byte, bool, error) {
-	preamble := []byte(ymodemClaimPreamble)
+	preamble := []byte(transferClaimPreamble)
 	var acc []byte
 	for {
 		n, err := conn.Read(buf)
@@ -84,9 +84,9 @@ func readClaim(conn net.Conn, buf []byte) ([]byte, bool, error) {
 // answerClaim takes or refuses the claim for conn and tells the client.
 func answerClaim(claim *portClaim, conn net.Conn) bool {
 	if !claim.take(conn) {
-		_, _ = conn.Write([]byte(ymodemClaimBusy))
+		_, _ = conn.Write([]byte(transferClaimBusy))
 		return false
 	}
-	_, _ = conn.Write([]byte(ymodemClaimOK))
+	_, _ = conn.Write([]byte(transferClaimOK))
 	return true
 }

@@ -1,6 +1,7 @@
 package serialmain
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -32,6 +33,11 @@ func Main(commandName string) {
 	app := cli.New(deps)
 
 	if err := app.Run(os.Args[1:], os.Stdout); err != nil {
+		// A transfer prints its own result line and picks the exit code.
+		var exit *cli.ExitError
+		if errors.As(err, &exit) {
+			os.Exit(exit.Code)
+		}
 		fmt.Fprintln(os.Stderr, commandName+":", err)
 		os.Exit(1)
 	}

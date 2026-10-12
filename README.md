@@ -464,7 +464,7 @@ sio tcp dev1 :7001
 sio share dev1 COM20 COM21
 ```
 
-`sio sz` sends one local file. `sio rz` receives one file. Enter the device shell command first. These commands then write only YMODEM-CRC bytes. Software flow control must stay off.
+`sio sz` sends one or more local files and `sio rz` receives every file the device sends, both with ZMODEM (CRC32, sliding window, resume through `<name>.zpart`). `--conflict skip-identical-else-rename|overwrite|skip|rename` decides what happens to an existing target (an explicit flag overrides the sender's own request; without it the sender's request, else skip-identical-else-rename, applies); `--window` sets the send window. The last line and exit code are `result: ok` (0), `result: failed: ...` (1), `result: skipped` (3, identical file already there), `result: resumed` (4), `result: cancelled` (5), `result: refused` (6, the receiver kept its existing file; `rz` does this unless run with `-o` or `-n`) or `result: partial: ...` (7, some files of a batch were refused or failed). Against the device, `sio sz --conflict` is only a request; use `rz -o` or `rz -n` on the device. Start `rz` on the device before `sio sz`. Software flow control must stay off.
 
 `sio shell` connects to the running named session in the foreground, prints serial
 output, and writes submitted lines to the port. It shows an internal `>>` prompt,

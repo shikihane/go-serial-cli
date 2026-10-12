@@ -792,11 +792,18 @@ func (b *shareBridge) closeClients() {
 }
 
 func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
-	defer b.removeClient(conn)
+	claimed := false
+	// Release the claim before telling the others it is over.
+	defer func() {
+		b.removeClient(conn)
+		if claimed {
+			b.noticeOthers(conn, transferReleaseNotice)
+		}
+	}()
 	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
 	forward := func(data []byte) error {
-		// Writes are dropped while another connection holds a YMODEM claim.
+		// Writes are dropped while another connection holds a transfer claim.
 		if len(data) == 0 || !b.claim.allows(conn) {
 			return nil
 		}
@@ -806,9 +813,12 @@ func (b *shareBridge) copyClientToEndpoints(conn net.Conn) error {
 		return b.captureTX(label, data)
 	}
 
-	data, claimed, err := readClaim(conn, buf)
-	if claimed && !answerClaim(&b.claim, conn) {
-		return nil
+	data, wantClaim, err := readClaim(conn, buf)
+	if wantClaim {
+		if !answerClaim(&b.claim, conn) {
+			return nil
+		}
+		claimed = true
 	}
 	for {
 		if fwdErr := forward(append([]byte(nil), data...)); fwdErr != nil {
@@ -902,7 +912,15 @@ func (b *shareBridge) writeToHubEndpointsAsync(data []byte) {
 	_ = b.writeToHubEndpoints(data)
 }
 
+// broadcast sends serial output to the clients. During a transfer claim
+// only the owner gets it, as in the session server.
 func (b *shareBridge) broadcast(data []byte) {
+	if owner := b.claim.current(); owner != nil {
+		if _, err := owner.Write(data); err != nil {
+			b.removeClient(owner)
+		}
+		return
+	}
 	b.mu.Lock()
 	clients := make([]net.Conn, 0, len(b.clients))
 	for conn := range b.clients {
@@ -989,7 +1007,7 @@ func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 	defer func() {
 		s.removeClient(conn)
 		if claimed {
-			s.noticeOthers(conn, ymodemReleaseNotice)
+			s.noticeOthers(conn, transferReleaseNotice)
 		}
 	}()
 	label := "tcp:" + conn.RemoteAddr().String()
@@ -999,12 +1017,12 @@ func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 		if len(data) == 0 {
 			return nil
 		}
-		// Writes are dropped while another connection holds a YMODEM
+		// Writes are dropped while another connection holds a file transfer
 		// claim. Say so once, so the user knows why keys do nothing.
 		if !s.claim.allows(conn) {
 			if !warned {
 				warned = true
-				_, _ = conn.Write([]byte(ymodemClaimNotice))
+				_, _ = conn.Write([]byte(transferClaimNotice))
 			}
 			return nil
 		}
@@ -1058,7 +1076,7 @@ func (s *sessionServer) copyPortToClients(portName string) error {
 	}
 }
 
-// broadcast sends serial output to the clients. During a YMODEM claim only
+// broadcast sends serial output to the clients. During a transfer claim only
 // the owner gets it: the others would print raw packets, and each extra
 // write delays the ACK the transfer is waiting for.
 func (s *sessionServer) broadcast(data []byte) {
@@ -1078,6 +1096,21 @@ func (s *sessionServer) broadcast(data []byte) {
 		if _, err := conn.Write(data); err != nil {
 			s.removeClient(conn)
 		}
+	}
+}
+
+// noticeOthers writes a line to every client but skip.
+func (b *shareBridge) noticeOthers(skip net.Conn, text string) {
+	b.mu.Lock()
+	clients := make([]net.Conn, 0, len(b.clients))
+	for conn := range b.clients {
+		if conn != skip {
+			clients = append(clients, conn)
+		}
+	}
+	b.mu.Unlock()
+	for _, conn := range clients {
+		_, _ = conn.Write([]byte(text))
 	}
 }
 

@@ -66,7 +66,10 @@ func TestBundledSkillExplainsOpenStartsSessionWorker(t *testing.T) {
 		"If `sio` is not installed but `gs` is, use `gs` as the legacy alias.",
 		"Exiting shell leaves the background session worker running",
 		"sio sz <session> <file>",
-		"sio rz <session> [local-file]",
+		"sio rz <session> [dest]",
+		"result: skipped",
+		"result: refused",
+		"result: partial",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bundled skill does not contain %q", want)

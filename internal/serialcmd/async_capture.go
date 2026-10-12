@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// asyncCapture moves cache writes off the forwarding path. A YMODEM
-// transfer waits for every ACK, so a disk write in front of the forward
+// asyncCapture moves cache writes off the forwarding path. A file
+// transfer waits on acknowledgements, so a disk write in front of the forward
 // adds straight to each packet. Chunks keep their arrival time and order.
 // When the queue is full, Write blocks rather than drop log data.
 type asyncCapture struct {

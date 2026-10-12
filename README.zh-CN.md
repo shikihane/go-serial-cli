@@ -385,7 +385,7 @@ sio tcp dev1 :7001
 sio share dev1 COM20 COM21
 ```
 
-`sio sz` 发送一个本地文件。`sio rz` 接收一个文件。设备上的 shell 命令由用户自己先敲。这两条命令连上会话 worker 后先声明独占写口，之后只写 YMODEM-CRC；传输期间其他客户端和共享虚拟串口的写入会被丢弃。worker 不认这个声明说明是旧版本，需要重启会话。软件流控必须关闭。
+`sio sz` 发送一个或多个本地文件，`sio rz` 接收设备发来的所有文件，都走 ZMODEM（CRC32、滑动窗口、通过 `<name>.zpart` 断点续传）。`--conflict skip-identical-else-rename|overwrite|skip|rename` 决定目标已存在时怎么处理（显式指定时优先于发送方的请求；不指定时服从发送方 ZF1，没有则用 skip-identical-else-rename）；`--window` 设置发送窗口。最后一行和退出码：`result: ok`（0）、`result: failed: ...`（1）、`result: skipped`（3，目标已是相同内容）、`result: resumed`（4）、`result: cancelled`（5）、`result: refused`（6，接收方保留已有文件；`rz` 不加 `-o`/`-n` 时就是这样）、`result: partial: ...`（7，批量中有文件被拒或失败）。对设备而言 `sio sz --conflict` 只是请求，覆盖或改名要在设备上用 `rz -o` 或 `rz -n`。先在设备上执行 `rz`，再运行 `sio sz`。传输时两条命令先向会话 worker 声明独占写口，期间其他客户端和共享虚拟串口的写入会被丢弃；worker 不认这个声明说明是旧版本，需要重启会话。软件流控必须关闭。
 
 `sio shell` 在前台保持命名会话打开，打印串口输出，并把提交的输入行写入串口。它会显示内部 `>>` 提示符，把每个 session 的命令历史保存到 `history.log`，支持上/下方向键召回历史，并用灰色显示最近的补全；按右方向键接受补全。每次在顶层命令输入中按 Tab，`sio` 都会保留本地前缀、丢弃旧设备候选、只向设备发送一个裸 Tab，并把随后 500 毫秒内仍正常显示的设备输出作为尽力而为的候选；本地提示符会在窗口结束后统一重绘，不会插入设备输出分块之间。设备候选只服务当前输入行；下一次 Tab、按右方向键接受候选、提交或取消输入时都会丢弃。输入中已经包含空白时仍只使用历史补全。输入行使用和 `send`、`ask` 相同的默认 CRLF 行模式。Ctrl+D 和其他非编辑控制键会立即透传，并先发送、再清空已有的本地输入前缀。单独按下 ESC 时，会经过一个用于区分方向键序列的短暂窗口后透传；方向键和 Backspace 仍用于本地编辑。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
 

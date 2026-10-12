@@ -195,8 +195,8 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"sio ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]",
 		"sio read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]",
 		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
-		"sio sz <session> <file>",
-		"sio rz <session> [local-file]",
+		"sio sz <session> <file>... [--conflict policy]",
+		"sio rz <session> [dest] [--conflict policy]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help output %q does not contain %q", got, want)
@@ -2081,23 +2081,37 @@ func TestSendRejectsSharedSessionWithoutControlChannel(t *testing.T) {
 	}
 }
 
-func TestRZUsesSessionControlAndDoesNotOpenPort(t *testing.T) {
-	var out bytes.Buffer
+func transferTestStore(t *testing.T) session.Store {
+	t.Helper()
 	store := session.Store{Dir: t.TempDir()}
 	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	local := filepath.Join(t.TempDir(), "note.bin")
-	if err := os.WriteFile(local, []byte("abcd"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	return store
+}
 
-	var got serialcmd.YModemOptions
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
+func TestSZSendsFilesOverZModemThroughSessionControl(t *testing.T) {
+	var out bytes.Buffer
+	store := transferTestStore(t)
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.bin")
+	b := filepath.Join(dir, "b.wav")
+	for _, p := range []string{a, b} {
+		if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got serialcmd.ZModemOptions
 	app := cli.New(cli.AppDeps{
 		Store: store,
-		TransferYModem: func(opts serialcmd.YModemOptions) error {
+		TransferZModem: func(opts serialcmd.ZModemOptions) error {
 			got = opts
-			_, _ = fmt.Fprintln(opts.Output, "ok note.bin 4")
+			opts.Result.Outcome = serialcmd.OutcomeOK
 			return nil
 		},
 		SendSerial: func(port string, baud int, data string) error {
@@ -2105,137 +2119,165 @@ func TestRZUsesSessionControlAndDoesNotOpenPort(t *testing.T) {
 			return nil
 		},
 	})
-	if err := app.Run([]string{"sz", "dev1", local}, &out); err != nil {
+	if err := app.Run([]string{"sz", "dev1", a, b, "--conflict", "overwrite", "--window", "8192", "--no-resume", "--escape", "-t", "30"}, &out); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if got.Address != "127.0.0.1:7002" || got.Command != "" || got.SendFile != "note.bin" {
+	if got.Address != "127.0.0.1:7002" || got.Receive || len(got.Files) != 2 || got.Files[0].Path != a || got.Files[1].Path != b {
 		t.Fatalf("options = %#v", got)
 	}
-	if !bytes.Equal(got.Payload, []byte("abcd")) {
-		t.Fatalf("payload = %q", got.Payload)
+	if got.Conflict != serialcmd.ConflictOverwrite || got.Window != 8192 || !got.NoResume || !got.EscapeCtl || got.HandshakeWait != 30*time.Second {
+		t.Fatalf("flags = %#v", got)
 	}
-	if !strings.Contains(out.String(), "ok note.bin 4") {
-		t.Fatalf("output = %q", out.String())
+	if lastLine(out.String()) != "result: ok" {
+		t.Fatalf("last line = %q", lastLine(out.String()))
 	}
 }
 
-func TestRZUsesSessionControlAndWritesLocalFile(t *testing.T) {
+func TestSZDefaultsAndRejectsBadInput(t *testing.T) {
+	store := transferTestStore(t)
+	file := filepath.Join(t.TempDir(), "a.bin")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var got serialcmd.ZModemOptions
+	app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error {
+		got = opts
+		return nil
+	}})
+	if err := app.Run([]string{"sz", "dev1", file}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// No --conflict: empty, so the device's ZF1 option is obeyed.
+	if got.Conflict != "" || got.Window != 0 || got.NoResume || got.EscapeCtl {
+		t.Fatalf("defaults = %#v", got)
+	}
+	for _, args := range [][]string{
+		{"sz", "dev1"},
+		{"sz", "dev1", file, "--conflict", "clobber"},
+		{"sz", "dev1", file, "--window", "10"},
+		{"sz", "dev1", file, "--bogus"},
+		{"sz", "dev1", t.TempDir()},
+		{"sz", "dev1", filepath.Join(t.TempDir(), "missing.bin")},
+	} {
+		if err := app.Run(args, io.Discard); err == nil {
+			t.Errorf("%v: want an error", args)
+		}
+	}
+}
+
+func TestRZDestinationForms(t *testing.T) {
+	store := transferTestStore(t)
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "in")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		dest     []string
+		wantDir  string
+		wantPath string
+	}{
+		{nil, ".", ""},
+		{[]string{existing}, existing, ""},
+		{[]string{filepath.Join(dir, "new") + string(os.PathSeparator)}, filepath.Join(dir, "new") + string(os.PathSeparator), ""},
+		{[]string{filepath.Join(dir, "out", "note.bin")}, filepath.Join(dir, "out"), filepath.Join(dir, "out", "note.bin")},
+	}
+	for _, tc := range cases {
+		var got serialcmd.ZModemOptions
+		app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error {
+			got = opts
+			return nil
+		}})
+		args := append([]string{"rz", "dev1"}, tc.dest...)
+		if err := app.Run(append(args, "--conflict", "rename"), io.Discard); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if !got.Receive || got.DestDir != tc.wantDir || got.DestPath != tc.wantPath || got.Conflict != serialcmd.ConflictRename {
+			t.Fatalf("%v: options = %#v", args, got)
+		}
+		if info, err := os.Stat(got.DestDir); err != nil || !info.IsDir() {
+			t.Fatalf("%v: dest dir %q not created", args, got.DestDir)
+		}
+	}
+	app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(serialcmd.ZModemOptions) error { return nil }})
+	for _, args := range [][]string{{"rz"}, {"rz", "dev1", "a", "b"}, {"rz", "dev1", "--window", "4096"}} {
+		if err := app.Run(args, io.Discard); err == nil {
+			t.Errorf("%v: want a usage error", args)
+		}
+	}
+}
+
+func TestTransferOutcomeSetsExitCodeAndLastLine(t *testing.T) {
+	store := transferTestStore(t)
+	file := filepath.Join(t.TempDir(), "a.bin")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		outcome  string
+		err      error
+		code     int
+		lastLine string
+	}{
+		{serialcmd.OutcomeOK, nil, 0, "result: ok"},
+		{serialcmd.OutcomeSkipped, nil, cli.ExitTransferSkipped, "result: skipped"},
+		{serialcmd.OutcomeResumed, nil, cli.ExitTransferResumed, "result: resumed"},
+		{serialcmd.OutcomeCancelled, serialcmd.ErrTransferCancelled, cli.ExitTransferCancelled, "result: cancelled"},
+		{serialcmd.OutcomeFailed, errors.New("no ZRINIT from the receiver"), cli.ExitTransferFailed, "result: failed: no ZRINIT from the receiver"},
+		{"", serialcmd.ErrTransferPortBusy, cli.ExitTransferFailed, "result: failed: " + serialcmd.ErrTransferPortBusy.Error()},
+		{serialcmd.OutcomeRefused, errors.New("1 of 1 file(s) not transferred"), cli.ExitTransferRefused, "result: refused"},
+		{serialcmd.OutcomePartial, errors.New("1 of 2 file(s) not transferred: b.bin (refused: exists)"), cli.ExitTransferPartial, "result: partial: 1 of 2 file(s) not transferred: b.bin (refused: exists)"},
+	}
+	codes := map[int]bool{}
+	for _, tc := range cases {
+		for _, args := range [][]string{{"sz", "dev1", file}, {"rz", "dev1", t.TempDir()}} {
+			var out bytes.Buffer
+			app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error {
+				opts.Result.Outcome = tc.outcome
+				return tc.err
+			}})
+			err := app.Run(args, &out)
+			code := 0
+			var exit *cli.ExitError
+			if errors.As(err, &exit) {
+				code = exit.Code
+			} else if err != nil {
+				t.Fatalf("%v %s: error %v is not an ExitError", args, tc.outcome, err)
+			}
+			if code != tc.code {
+				t.Fatalf("%v %s: exit code %d, want %d", args, tc.outcome, code, tc.code)
+			}
+			if got := lastLine(out.String()); got != tc.lastLine {
+				t.Fatalf("%v %s: last line %q, want %q", args, tc.outcome, got, tc.lastLine)
+			}
+		}
+		codes[tc.code] = true
+	}
+	if len(codes) != 7 {
+		t.Fatalf("exit codes are not distinct: %v", codes)
+	}
+}
+
+func TestSZConflictFlagWarnsThatTheDeviceDecides(t *testing.T) {
+	store := transferTestStore(t)
+	file := filepath.Join(t.TempDir(), "a.bin")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error { return nil }})
 	var out bytes.Buffer
-	store := session.Store{Dir: t.TempDir()}
-	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
-		t.Fatalf("Save returned error: %v", err)
-	}
-	local := filepath.Join(t.TempDir(), "out", "note.bin")
-	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+	if err := app.Run([]string{"sz", "dev1", file, "--conflict", "overwrite"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	app := cli.New(cli.AppDeps{
-		Store: store,
-		TransferYModem: func(opts serialcmd.YModemOptions) error {
-			if opts.Address != "127.0.0.1:7002" || opts.Command != "" || opts.SendFile != "" || opts.Payload != nil {
-				t.Fatalf("options = %#v", opts)
-			}
-			if opts.RecvWriter == nil {
-				t.Fatal("missing receive writer")
-			}
-			if opts.Status != nil {
-				opts.Status.Name = "note.bin"
-			}
-			_, _ = opts.RecvWriter.Write([]byte("hello"))
-			_, _ = fmt.Fprintln(opts.Output, "ok note.bin 5")
-			return nil
-		},
-	})
-	if err := app.Run([]string{"rz", "dev1", local}, &out); err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	if !strings.Contains(out.String(), "rz -o") {
+		t.Fatalf("no hint that the device decides: %q", out.String())
 	}
-	got, err := os.ReadFile(local)
-	if err != nil {
+	out.Reset()
+	if err := app.Run([]string{"sz", "dev1", file}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "hello" {
-		t.Fatalf("file = %q", got)
-	}
-}
-
-func TestSZSendsLocalFileWithoutWritingShellCommand(t *testing.T) {
-	dir := t.TempDir()
-	old, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
-	if err := os.WriteFile("README.md", []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	store := session.Store{Dir: t.TempDir()}
-	if err := store.Save(session.State{Name: "dev", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
-		t.Fatal(err)
-	}
-	app := cli.New(cli.AppDeps{
-		Store: store,
-		TransferYModem: func(opts serialcmd.YModemOptions) error {
-			if opts.Command != "" || opts.RecvWriter != nil {
-				t.Fatalf("options = %#v", opts)
-			}
-			if !bytes.Equal(opts.Payload, []byte("keep")) || opts.SendFile != "README.md" {
-				t.Fatalf("payload = %q name = %q", opts.Payload, opts.SendFile)
-			}
-			return nil
-		},
-	})
-	if err := app.Run([]string{"sz", "dev", "README.md"}, io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "keep" {
-		t.Fatalf("file = %q, want keep", got)
-	}
-}
-
-func TestRZUsesBlock0NameWhenLocalNameOmitted(t *testing.T) {
-	dir := t.TempDir()
-	old, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
-
-	store := session.Store{Dir: t.TempDir()}
-	if err := store.Save(session.State{Name: "dev", Port: "COM3", Baud: 3000000, ControlAddress: "127.0.0.1:7002"}); err != nil {
-		t.Fatal(err)
-	}
-	app := cli.New(cli.AppDeps{
-		Store: store,
-		TransferYModem: func(opts serialcmd.YModemOptions) error {
-			if opts.Command != "" || opts.Payload != nil {
-				t.Fatalf("options = %#v", opts)
-			}
-			if opts.Status != nil {
-				opts.Status.Name = "README.md"
-			}
-			_, _ = opts.RecvWriter.Write([]byte("hello"))
-			return nil
-		},
-	})
-	if err := app.Run([]string{"rz", "dev"}, io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(filepath.Join(dir, "README.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "hello" {
-		t.Fatalf("file = %q", got)
+	if strings.Contains(out.String(), "rz -o") {
+		t.Fatalf("hint shown without --conflict: %q", out.String())
 	}
 }
 
@@ -2244,13 +2286,30 @@ func TestRZRejectsPausedSession(t *testing.T) {
 	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000, Paused: true, ControlAddress: "127.0.0.1:7002"}); err != nil {
 		t.Fatalf("Save returned error: %v", err)
 	}
-	app := cli.New(cli.AppDeps{Store: store, TransferYModem: func(opts serialcmd.YModemOptions) error {
+	app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error {
 		t.Fatal("paused session should not transfer")
 		return nil
 	}})
-	err := app.Run([]string{"sz", "dev1", "note.bin"}, io.Discard)
-	if err == nil || !errors.Is(err, cli.ErrSessionPaused) {
-		t.Fatalf("err = %v, want paused", err)
+	for _, args := range [][]string{{"sz", "dev1", "note.bin"}, {"rz", "dev1"}} {
+		err := app.Run(args, io.Discard)
+		if err == nil || !errors.Is(err, cli.ErrSessionPaused) {
+			t.Fatalf("%v: err = %v, want paused", args, err)
+		}
+	}
+}
+
+func TestTransferNeedsRunningWorker(t *testing.T) {
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 3000000}); err != nil {
+		t.Fatal(err)
+	}
+	app := cli.New(cli.AppDeps{Store: store, TransferZModem: func(opts serialcmd.ZModemOptions) error {
+		t.Fatal("transfer without a worker")
+		return nil
+	}})
+	err := app.Run([]string{"rz", "dev1"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "no running worker") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

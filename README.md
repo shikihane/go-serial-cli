@@ -466,6 +466,17 @@ sio share dev1 COM20 COM21
 
 `sio sz` sends one or more local files and `sio rz` receives every file the device sends, both with ZMODEM (CRC32, sliding window, resume through `<name>.zpart`). `--conflict skip-identical-else-rename|overwrite|skip|rename` decides what happens to an existing target (an explicit flag overrides the sender's own request; without it the sender's request, else skip-identical-else-rename, applies); `--window` sets the send window. The last line and exit code are `result: ok` (0), `result: failed: ...` (1), `result: skipped` (3, identical file already there), `result: resumed` (4), `result: cancelled` (5), `result: refused` (6, the receiver kept its existing file; `rz` does this unless run with `-o` or `-n`) or `result: partial: ...` (7, some files of a batch were refused or failed). Against the device, `sio sz --conflict` is only a request; use `rz -o` or `rz -n` on the device. Start `rz` on the device before `sio sz`. Software flow control must stay off.
 
+In `sio shell`, running `sz <file>` or `rz` on the device opens a Save As or Open dialog by itself and runs the transfer; Ctrl+C cancels it without leaving the shell. `sio shell <session> --no-auto-transfer` turns this off, and `--raw` sessions never do it.
+
+On a terminal the transfer shows a two-line status panel at the bottom, redrawn in place and fitted to the terminal width:
+
+```text
+↓ rec_0012.wav  [##########----------]  50%  1.5 MB/3.0 MB
+290.1 KB/s  ETA 0:05  retrans 0  CRC err 0  W 16384  CRC32  file 1/2
+```
+
+The first line has the direction (↑ to the device, ↓ from it), the file name, a bar, the percent and the size; the second has the rate, ETA, retransmissions (ZRPOS), CRC errors, window, CRC type and file number. Before data flows the panel names the step it waits on (the device, the dialog, a CRC check of an existing file) and how long it has waited; a file without a size shows bytes and rate only. When the session ends the panel is replaced by a summary (outcome, files, bytes, time, average rate, retransmissions, CRC errors, resume offset) and `按回车返回 shell / Press Enter to return to the shell`. Only Enter (or Ctrl+C) closes it; other keys are ignored, and device output that arrives meanwhile is shown after it. With output redirected the shell prints plain progress lines and returns at once. `sio sz` and `sio rz` keep their single progress line.
+
 `sio shell` connects to the running named session in the foreground, prints serial
 output, and writes submitted lines to the port. It shows an internal `>>` prompt,
 stores per-session command history in `history.log`, supports Up/Down recall,

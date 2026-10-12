@@ -194,3 +194,29 @@ func TestStoreUsesPerSessionHistoryPath(t *testing.T) {
 		t.Fatalf("HistoryPath dir = %q, want %q", filepath.Dir(store.HistoryPath("dev1")), store.SessionDir("dev1"))
 	}
 }
+
+func TestStoreRemembersLastTransferDir(t *testing.T) {
+	store := session.Store{Dir: t.TempDir()}
+	if got := store.LastTransferDir("dev1"); got != "" {
+		t.Fatalf("LastTransferDir before save = %q", got)
+	}
+	dir := t.TempDir()
+	if err := store.SaveLastTransferDir("dev1", dir); err != nil {
+		t.Fatalf("SaveLastTransferDir: %v", err)
+	}
+	if got := store.LastTransferDir("dev1"); got != dir {
+		t.Fatalf("LastTransferDir = %q, want %q", got, dir)
+	}
+	if filepath.Dir(store.TransferDirPath("dev1")) != store.SessionDir("dev1") {
+		t.Fatalf("TransferDirPath %q is not in the session dir", store.TransferDirPath("dev1"))
+	}
+	if got := store.LastTransferDir("dev2"); got != "" {
+		t.Fatalf("another session sees %q", got)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.LastTransferDir("dev1"); got != "" {
+		t.Fatalf("LastTransferDir for a removed folder = %q", got)
+	}
+}

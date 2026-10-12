@@ -47,6 +47,20 @@ func shellOutputConsoleMode(mode uint32) uint32 {
 	return mode | windows.ENABLE_PROCESSED_OUTPUT | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING
 }
 
+// terminalWidth returns the visible columns of the console out writes
+// to, or 0 when out is no console.
+func terminalWidth(out io.Writer) int {
+	f, ok := out.(*os.File)
+	if !ok {
+		return 0
+	}
+	var info windows.ConsoleScreenBufferInfo
+	if err := windows.GetConsoleScreenBufferInfo(windows.Handle(f.Fd()), &info); err != nil {
+		return 0
+	}
+	return int(info.Window.Right-info.Window.Left) + 1
+}
+
 func shellConsoleInput(input io.Reader) io.Reader {
 	if input != os.Stdin {
 		return input

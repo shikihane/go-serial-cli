@@ -450,6 +450,35 @@ func TestZModemPeerCancelDuringDialogClosesPicker(t *testing.T) {
 	}
 }
 
+// Ctrl+C in the shell: every press goes to the transfer; the second one
+// also forces the wait for the device result line to end.
+func TestShellGateCtrlCPresses(t *testing.T) {
+	g := newShellGate()
+	cancel := g.begin()
+	force := g.forced()
+	g.feed([]byte{0x03})
+	select {
+	case <-cancel:
+	default:
+		t.Fatal("first Ctrl+C did not cancel")
+	}
+	select {
+	case <-force:
+		t.Fatal("first Ctrl+C forced")
+	default:
+	}
+	g.feed([]byte{0x03})
+	g.feed([]byte{0x03})
+	select {
+	case <-force:
+	default:
+		t.Fatal("second Ctrl+C did not force")
+	}
+	if !g.feed([]byte("x")) {
+		t.Fatal("keys leaked to the device during the transfer")
+	}
+}
+
 // A forced cancel does not wait the full result window for device text.
 func TestZModemForceSkipsResultWait(t *testing.T) {
 	a, b := newZWire(zWireConfig{}, zWireConfig{})

@@ -195,6 +195,7 @@ func TestHelpPrintsVersionSummary(t *testing.T) {
 		"sio ask <session> [--raw] [-x] [-T] <data...> [-t seconds] [-l lines]",
 		"sio read <session> [-x] [-T] [-n count] [--all|--tx] [--to file]",
 		"sio check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]",
+		"sio shell <session> [--no-auto-transfer]",
 		"sio sz <session> <file>... [--conflict policy]",
 		"sio rz <session> [dest] [--conflict policy]",
 	} {
@@ -2310,6 +2311,59 @@ func TestTransferNeedsRunningWorker(t *testing.T) {
 	err := app.Run([]string{"rz", "dev1"}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "no running worker") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestShellAutoTransferFlags(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     bool
+		args    []string
+		wantSet bool
+	}{
+		{"default-on", false, []string{"shell", "dev1"}, true},
+		{"flag-off", false, []string{"shell", "dev1", "--no-auto-transfer"}, false},
+		{"flag-before-name", false, []string{"shell", "--no-auto-transfer", "dev1"}, false},
+		{"raw-session-off", true, []string{"shell", "dev1"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := session.Store{Dir: t.TempDir()}
+			if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200, RawMode: tc.raw, ControlAddress: "127.0.0.1:7005"}); err != nil {
+				t.Fatal(err)
+			}
+			var got serialcmd.ShellStreamOptions
+			app := cli.New(cli.AppDeps{
+				Store:      store,
+				Stdin:      strings.NewReader(""),
+				FilePicker: func() serialcmd.FilePicker { return nil },
+				StreamShell: func(opts serialcmd.ShellStreamOptions) error {
+					got = opts
+					return nil
+				},
+			})
+			if err := app.Run(tc.args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if (got.Transfer != nil) != tc.wantSet {
+				t.Fatalf("Transfer set = %v, want %v", got.Transfer != nil, tc.wantSet)
+			}
+			if got.Transfer == nil {
+				return
+			}
+			if got.Transfer.Conflict != "" {
+				t.Fatalf("conflict = %q, want none so the device's ZF1 is obeyed", got.Transfer.Conflict)
+			}
+			dir := t.TempDir()
+			got.Transfer.SaveLastDir(dir)
+			if got.Transfer.LastDir() != dir || store.LastTransferDir("dev1") != dir {
+				t.Fatalf("last dir = %q / %q, want %q", got.Transfer.LastDir(), store.LastTransferDir("dev1"), dir)
+			}
+		})
+	}
+	app := cli.New(cli.AppDeps{Store: session.Store{Dir: t.TempDir()}})
+	if err := app.Run([]string{"shell", "dev1", "--bogus"}, io.Discard); err == nil {
+		t.Fatal("unknown shell flag: want a usage error")
 	}
 }
 

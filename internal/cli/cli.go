@@ -16,6 +16,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"go-serial-cli/internal/picker"
 	"go-serial-cli/internal/serialcmd"
 	"go-serial-cli/internal/session"
 	workerpkg "go-serial-cli/internal/worker"
@@ -57,12 +58,16 @@ type AppDeps struct {
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
 	StreamShell           func(opts serialcmd.ShellStreamOptions) error
 	TransferZModem        func(opts serialcmd.ZModemOptions) error
+	FilePicker            func() serialcmd.FilePicker
 	IsProcessRunning      func(pid int) bool
 	RetrySleep            func(delay time.Duration)
 	Stdin                 io.Reader
 	ShellInterrupts       <-chan os.Signal
 	ConfigureShellConsole func() func()
-	Version               VersionInfo
+	// TerminalWidth reports the columns of the terminal out writes to, or
+	// 0 when it is none. sio shell shows its transfer panel only then.
+	TerminalWidth func(out io.Writer) int
+	Version       VersionInfo
 }
 
 func New(deps AppDeps) *App {
@@ -215,10 +220,12 @@ func DefaultDeps() (AppDeps, error) {
 		StreamSession:         serialcmd.StreamSession,
 		StreamShell:           serialcmd.StreamShell,
 		TransferZModem:        serialcmd.TransferZModem,
+		FilePicker:            picker.New,
 		IsProcessRunning:      isProcessRunning,
 		RetrySleep:            time.Sleep,
 		Stdin:                 os.Stdin,
 		ConfigureShellConsole: configureShellConsole,
+		TerminalWidth:         terminalWidth,
 	}, nil
 }
 
@@ -843,6 +850,64 @@ func teeOutput(out io.Writer, path string) (io.Writer, func(), error) {
 	}, nil
 }
 
+func (a *App) runShell(args []string, out io.Writer) error {
+	name := ""
+	autoTransfer := true
+	for _, arg := range args {
+		switch {
+		case arg == "--no-auto-transfer":
+			autoTransfer = false
+		case strings.HasPrefix(arg, "-") || name != "":
+			return a.usage("shell <session> [--no-auto-transfer]")
+		default:
+			name = arg
+		}
+	}
+	if name == "" {
+		return a.usage("shell <session> [--no-auto-transfer]")
+	}
+	var hooks shellTransferHooks
+	input := a.deps.Stdin
+	usingDefaultStdin := input == nil || input == os.Stdin
+	if input == nil {
+		input = os.Stdin
+	}
+	if usingDefaultStdin || a.deps.ShellInterrupts != nil {
+		historyPath := ""
+		if a.deps.Store.Dir != "" {
+			historyPath = a.deps.Store.HistoryPath(name)
+		}
+		var restoreConsole func()
+		if usingDefaultStdin && a.deps.ConfigureShellConsole != nil {
+			restoreConsole = a.deps.ConfigureShellConsole()
+		}
+		if usingDefaultStdin {
+			input = shellConsoleInput(input)
+		}
+		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
+		defer cleanup()
+		if restoreConsole != nil {
+			defer restoreConsole()
+		}
+		hooks.active, hooks.rawKeys = state.setTransfer, state.setRawKeys
+		if a.deps.TerminalWidth != nil {
+			terminal := out
+			hooks.width = func() int { return a.deps.TerminalWidth(terminal) }
+		}
+		input = wrappedInput
+		out = wrappedOutput
+	}
+	return a.runShellStream(name, input, out, autoTransfer, hooks)
+}
+
+// shellTransferHooks let a transfer the shell detects take the keyboard
+// and, on a terminal, show its status panel.
+type shellTransferHooks struct {
+	active  func(bool)
+	rawKeys func(bool)
+	width   func() int
+}
+
 // Exit codes of sio sz and sio rz. The last output line names the outcome
 // too: "result: ok", "result: skipped" (identical already there),
 // "result: resumed", "result: cancelled", "result: refused" (the
@@ -1153,40 +1218,27 @@ func isConsoleOutput(out io.Writer) bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
-func (a *App) runShell(args []string, out io.Writer) error {
-	if len(args) != 1 {
-		return a.usage("shell <session>")
+// shellTransferOptions sets up ZMODEM auto-detection for sio shell.
+func (a *App) shellTransferOptions(name string, hooks shellTransferHooks) *serialcmd.ShellTransferOptions {
+	var picker serialcmd.FilePicker
+	if a.deps.FilePicker != nil {
+		picker = a.deps.FilePicker()
 	}
-	name := args[0]
-	input := a.deps.Stdin
-	usingDefaultStdin := input == nil || input == os.Stdin
-	if input == nil {
-		input = os.Stdin
+	store := a.deps.Store
+	return &serialcmd.ShellTransferOptions{
+		Picker:      picker,
+		LastDir:     func() string { return store.LastTransferDir(name) },
+		SaveLastDir: func(dir string) { _ = store.SaveLastTransferDir(name, dir) },
+		Active:      hooks.active,
+		RawKeys:     hooks.rawKeys,
+		Width:       hooks.width,
 	}
-	if usingDefaultStdin || a.deps.ShellInterrupts != nil {
-		historyPath := ""
-		if a.deps.Store.Dir != "" {
-			historyPath = a.deps.Store.HistoryPath(name)
-		}
-		var restoreConsole func()
-		if usingDefaultStdin && a.deps.ConfigureShellConsole != nil {
-			restoreConsole = a.deps.ConfigureShellConsole()
-		}
-		if usingDefaultStdin {
-			input = shellConsoleInput(input)
-		}
-		wrappedInput, wrappedOutput, cleanup := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
-		defer cleanup()
-		if restoreConsole != nil {
-			defer restoreConsole()
-		}
-		input = wrappedInput
-		out = wrappedOutput
-	}
-	return a.runShellStream(name, input, out)
 }
 
-func (a *App) runShellStream(name string, input io.Reader, out io.Writer) error {
+// runShellStream prefers the shell-specific session stream, which overlays
+// other senders' captured TX as tagged lines. It falls back to the generic
+// stream when no worker control channel or shell streamer is available.
+func (a *App) runShellStream(name string, input io.Reader, out io.Writer, autoTransfer bool, hooks shellTransferHooks) error {
 	if a.deps.Store.Dir != "" && a.deps.StreamShell != nil {
 		state, err := a.deps.Store.Load(name)
 		if err != nil {
@@ -1198,13 +1250,19 @@ func (a *App) runShellStream(name string, input io.Reader, out io.Writer) error 
 		if address, ok, err := sessionDialAddress(state); err != nil {
 			return err
 		} else if ok {
-			return a.deps.StreamShell(serialcmd.ShellStreamOptions{
+			opts := serialcmd.ShellStreamOptions{
 				Address:          address,
 				Input:            input,
 				Output:           out,
 				TxCachePath:      a.deps.Store.TxCachePath(name),
 				TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
-			})
+			}
+			// A raw session carries arbitrary bytes; never read them as a
+			// transfer request.
+			if autoTransfer && !state.RawMode {
+				opts.Transfer = a.shellTransferOptions(name, hooks)
+			}
+			return a.deps.StreamShell(opts)
 		}
 	}
 	return a.runStream(name, serialcmd.StreamOptions{Input: input}, out)
@@ -1230,7 +1288,12 @@ const shellCompletionCaptureLimit = 32 * 1024
 // of the burst.
 const shellPromptRedrawDelay = 100 * time.Millisecond
 
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, io.Writer, func()) {
+// shellInputWithInterrupts wraps the console for sio shell. The returned
+// state switches transfer mode: while a file transfer runs, Ctrl+C goes
+// to the transfer and never counts toward leaving the shell, and the
+// input prompt is not redrawn over the progress line. Raw keys pass keys
+// on with no echo while the transfer panel is shown.
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, io.Writer, func(), *shellInputState) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
 	state := newShellInputState(echo, historyPath)
@@ -1256,6 +1319,13 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 					return
 				}
 				now := time.Now()
+				if state.inTransfer() {
+					lastInterrupt = time.Time{}
+					go func() {
+						_, _ = writer.Write([]byte{0x03})
+					}()
+					continue
+				}
 				if !lastInterrupt.IsZero() && now.Sub(lastInterrupt) <= shellInterruptExitWindow {
 					if now.Sub(lastInterrupt) <= shellInterruptDuplicateWindow {
 						continue
@@ -1280,7 +1350,7 @@ func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo
 			signal.Stop(notifyCh)
 		}
 		_ = writer.Close()
-	}
+	}, state
 }
 
 func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}, state *shellInputState) {
@@ -1335,6 +1405,10 @@ type shellInputState struct {
 	partialPending    bool
 	redrawGen         uint64
 	redrawTimer       *time.Timer
+	transfer          bool
+	// rawKeys passes keys on as typed, with no echo or editing, while the
+	// transfer panel owns the screen.
+	rawKeys bool
 }
 
 type shellOutputWriter struct {
@@ -1360,6 +1434,13 @@ func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
 
 func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	s.mu.Lock()
+	if s.rawKeys {
+		s.inputWriteMu.Lock()
+		s.mu.Unlock()
+		defer s.inputWriteMu.Unlock()
+		_, err := writer.Write(data)
+		return err
+	}
 	s.flushPartialPendingLocked()
 	s.prompt()
 	var writes [][]byte
@@ -1382,6 +1463,11 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		if ch == 0x1b {
 			s.esc = append(s.esc[:0], ch)
 			s.scheduleEscapeFlushLocked(writer)
+			continue
+		}
+		if ch == 0x03 && s.transfer {
+			s.lastCtrlC = time.Time{}
+			writes = append(writes, []byte{ch})
 			continue
 		}
 		if ch == 0x03 {
@@ -1456,6 +1542,39 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	return nil
 }
 
+// setTransfer turns transfer mode on or off. Leaving it shows a fresh
+// prompt under the transfer summary.
+func (s *shellInputState) setTransfer(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.transfer = active
+	s.lastCtrlC = time.Time{}
+	s.cancelPartialPendingLocked()
+	s.discardDeviceCompletionsLocked()
+	if !active {
+		s.line = s.line[:0]
+		s.cursor = 0
+		s.prompted = false
+		s.prompt()
+	}
+}
+
+// setRawKeys turns raw keys on or off. Turning them on drops a pending
+// escape sequence; the line being edited stays for later.
+func (s *shellInputState) setRawKeys(raw bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rawKeys = raw
+	s.cancelEscapeFlushLocked()
+	s.esc = s.esc[:0]
+}
+
+func (s *shellInputState) inTransfer() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transfer
+}
+
 func (s *shellInputState) takeImmediateInputLocked(control []byte) []byte {
 	hadLine := len(s.line) > 0
 	payload := make([]byte, 0, len(s.line)+len(control))
@@ -1495,6 +1614,9 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 		if n != len(data) {
 			return n, io.ErrShortWrite
 		}
+	}
+	if s.transfer {
+		return len(data), nil
 	}
 	if s.prompted {
 		if s.completionActive {
@@ -3261,7 +3383,7 @@ Usage:
   %[1]s check <session> [-x] [-n count] [--from offset] [--rewind count] [--to file]
   %[1]s clear <session>
   %[1]s clear --share
-  %[1]s shell <session>
+  %[1]s shell <session> [--no-auto-transfer]
   %[1]s sz <session> <file>... [--conflict policy] [--window bytes] [--no-resume] [--escape] [-t seconds]
   %[1]s rz <session> [dest] [--conflict policy] [--escape] [-t seconds]
   %[1]s tee <session> <file>

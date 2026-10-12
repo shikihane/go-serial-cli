@@ -24,6 +24,9 @@ type ShellStreamOptions struct {
 	Output           io.Writer
 	TxCachePath      string
 	TxCacheIndexPath string
+	// Transfer, when set, starts a ZMODEM transfer when the device output
+	// carries a valid hex ZRQINIT or ZRINIT header.
+	Transfer *ShellTransferOptions
 }
 
 // StreamShell attaches an interactive shell to a session worker and, when the
@@ -40,6 +43,16 @@ func StreamShell(opts ShellStreamOptions) error {
 	if output == nil {
 		output = io.Discard
 	}
+	var transfer *shellTransfer
+	input := opts.Input
+	var muted func() bool
+	if opts.Transfer != nil {
+		transfer = &shellTransfer{opts: *opts.Transfer, address: opts.Address, out: output, gate: newShellGate(), run: TransferZModem}
+		if input != nil {
+			input = &gatedReader{r: input, gate: transfer.gate}
+		}
+		muted = transfer.muted
+	}
 	if opts.TxCachePath != "" {
 		indexPath := opts.TxCacheIndexPath
 		if indexPath == "" {
@@ -48,22 +61,23 @@ func StreamShell(opts ShellStreamOptions) error {
 		selfSource := "tcp:" + conn.LocalAddr().String()
 		stop := make(chan struct{})
 		defer close(stop)
-		go tailTXOverlay(stop, opts.TxCachePath, indexPath, selfSource, output)
+		go tailTXOverlay(stop, opts.TxCachePath, indexPath, selfSource, output, muted)
 	}
 	errCh := make(chan error, 2)
-	if opts.Input != nil {
+	if input != nil {
 		go func() {
-			errCh <- copyInputToPort(opts.Input, conn, opts.Address)
+			errCh <- copyInputToPort(input, conn, opts.Address)
 		}()
 	}
 	go func() {
-		_, err := io.Copy(output, conn)
-		errCh <- normalizeCopyError(err)
+		errCh <- normalizeCopyError(copyShellOutput(conn, output, transfer))
 	}()
 	return <-errCh
 }
 
-func tailTXOverlay(stop <-chan struct{}, cachePath string, indexPath string, selfSource string, out io.Writer) {
+// tailTXOverlay prints other senders' TX. While muted reports a transfer,
+// the claim lets only the transfer itself write, so nothing is shown.
+func tailTXOverlay(stop <-chan struct{}, cachePath string, indexPath string, selfSource string, out io.Writer, muted func() bool) {
 	var indexOffset int64
 	if info, err := os.Stat(indexPath); err == nil {
 		indexOffset = info.Size()
@@ -80,7 +94,7 @@ func tailTXOverlay(stop <-chan struct{}, cachePath string, indexPath string, sel
 		entries, newOffset := readCacheIndexFrom(indexPath, indexOffset)
 		indexOffset = newOffset
 		for _, entry := range entries {
-			if entry.Source == "" || entry.Source == selfSource {
+			if entry.Source == "" || entry.Source == selfSource || (muted != nil && muted()) {
 				continue
 			}
 			data := readCacheRangeBytes(cachePath, entry.Offset, entry.Length)

@@ -70,6 +70,7 @@ func TestBundledSkillExplainsOpenStartsSessionWorker(t *testing.T) {
 		"result: skipped",
 		"result: refused",
 		"result: partial",
+		"--no-auto-transfer",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bundled skill does not contain %q", want)

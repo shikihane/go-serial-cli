@@ -894,12 +894,15 @@ func TestShellUsesDeviceTabOutputAsSuggestion(t *testing.T) {
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
+			if got := out.String(); !strings.Contains(got, "\r\n\x1b[7m radio \x1b[0m\r\n radio_shell") {
+				return fmt.Errorf("output = %q, want menu with every device candidate", got)
+			}
 
-			if _, err := stdinWriter.Write([]byte("\x1b[C")); err != nil {
+			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
 				return fmt.Errorf("accept device suggestion: %w", err)
 			}
 			deadline = time.After(2 * time.Second)
-			for !strings.Contains(out.String(), ">> radio") {
+			for !strings.Contains(out.String(), "\x1b[2K>> radio\x1b[J") {
 				select {
 				case <-deadline:
 					return fmt.Errorf("timed out waiting for accepted device suggestion; output = %q", out.String())
@@ -936,7 +939,7 @@ func TestShellUsesDeviceTabOutputAsSuggestion(t *testing.T) {
 	}
 }
 
-func TestShellDiscardsPreviousDeviceSuggestionBeforeNextTabQuery(t *testing.T) {
+func TestShellTabAndArrowsMoveThroughCompletionMenu(t *testing.T) {
 	var out lockedBuffer
 	stdin, stdinWriter := io.Pipe()
 	defer stdinWriter.Close()
@@ -974,8 +977,26 @@ func TestShellDiscardsPreviousDeviceSuggestionBeforeNextTabQuery(t *testing.T) {
 				}
 			}
 
-			if _, err := stdinWriter.Write([]byte("\t")); err != nil {
-				return fmt.Errorf("write second completion query: %w", err)
+			// Tab, Up and Down only move the selection; nothing reaches
+			// the device until a fresh query below.
+			if _, err := stdinWriter.Write([]byte("\t\x1b[A\x1b[B")); err != nil {
+				return fmt.Errorf("move through menu: %w", err)
+			}
+			deadline = time.After(2 * time.Second)
+			for strings.Count(out.String(), "\r\n radio\r\n\x1b[7m radio_shell \x1b[0m") < 2 {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for moved selection; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if !strings.Contains(out.String(), ">> ra\x1b[90mdio_shell\x1b[0m") {
+				return fmt.Errorf("output = %q, want gray suffix to follow the selection", out.String())
+			}
+
+			if _, err := stdinWriter.Write([]byte("\r\t")); err != nil {
+				return fmt.Errorf("accept selection and query again: %w", err)
 			}
 			secondQuery := make([]byte, 1)
 			select {
@@ -988,18 +1009,18 @@ func TestShellDiscardsPreviousDeviceSuggestionBeforeNextTabQuery(t *testing.T) {
 				return errors.New("timed out waiting for second bare Tab query")
 			}
 			if !bytes.Equal(secondQuery, []byte{'\t'}) {
-				return fmt.Errorf("second completion query = %q, want bare Tab", secondQuery)
+				return fmt.Errorf("second completion query = %q, want bare Tab after menu moves sent nothing", secondQuery)
 			}
 
-			if _, err := stdinWriter.Write([]byte("\x1b[C\r")); err != nil {
+			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
 				return fmt.Errorf("submit while replacement query is pending: %w", err)
 			}
-			committed := make([]byte, len("ra\n"))
+			committed := make([]byte, len("radio_shell\n"))
 			if _, err := io.ReadFull(opts.Input, committed); err != nil {
 				return fmt.Errorf("read input after replacement query: %w", err)
 			}
-			if string(committed) != "ra\n" {
-				return fmt.Errorf("input after replacement query = %q, want old suggestion discarded", committed)
+			if string(committed) != "radio_shell\n" {
+				return fmt.Errorf("input after replacement query = %q, want accepted selection", committed)
 			}
 			_ = stdinWriter.Close()
 			return nil
@@ -1049,6 +1070,11 @@ func TestShellDiscardsDeviceSuggestionsAfterSubmittingCurrentLine(t *testing.T) 
 				}
 			}
 
+			// Escape closes the menu locally, so Enter submits the typed text.
+			if _, err := stdinWriter.Write([]byte("\x1b")); err != nil {
+				return fmt.Errorf("close completion menu: %w", err)
+			}
+			time.Sleep(100 * time.Millisecond)
 			if _, err := stdinWriter.Write([]byte("\r")); err != nil {
 				return fmt.Errorf("submit first line without accepting suggestion: %w", err)
 			}
@@ -1169,6 +1195,61 @@ func TestShellUsesHistoryInsteadOfDeviceQueryForSubcommandCompletion(t *testing.
 			}
 			if string(committed) != "radio scan\n" {
 				return fmt.Errorf("subcommand stream input = %q, want only %q", committed, "radio scan\\n")
+			}
+			_ = stdinWriter.Close()
+			return nil
+		},
+	})
+
+	if err := app.Run([]string{"shell", "dev1"}, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestShellTabOffersEveryMatchingHistoryEntry(t *testing.T) {
+	var out lockedBuffer
+	stdin, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := os.MkdirAll(store.SessionDir("dev1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	history := "lnx record start\nlnx record stop\nlnx record config\nlnx record stop\n"
+	if err := os.WriteFile(store.HistoryPath("dev1"), []byte(history), 0o644); err != nil {
+		t.Fatalf("WriteFile history returned error: %v", err)
+	}
+
+	app := cli.New(cli.AppDeps{
+		Store:           store,
+		Stdin:           stdin,
+		ShellInterrupts: make(chan os.Signal),
+		StreamSerial: func(opts serialcmd.StreamOptions) error {
+			if _, err := stdinWriter.Write([]byte("lnx record \t")); err != nil {
+				return fmt.Errorf("open history menu: %w", err)
+			}
+			deadline := time.After(2 * time.Second)
+			want := "\r\n\x1b[7m lnx record stop \x1b[0m\r\n lnx record config\r\n lnx record start"
+			for !strings.Contains(out.String(), want) {
+				select {
+				case <-deadline:
+					return fmt.Errorf("timed out waiting for history menu; output = %q", out.String())
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			// Down twice selects start; Enter fills it in, the next Enter sends it.
+			if _, err := stdinWriter.Write([]byte("\x1b[B\x1b[B\r\r")); err != nil {
+				return fmt.Errorf("pick and submit: %w", err)
+			}
+			committed := make([]byte, len("lnx record start\n"))
+			if _, err := io.ReadFull(opts.Input, committed); err != nil {
+				return fmt.Errorf("read committed line: %w", err)
+			}
+			if string(committed) != "lnx record start\n" {
+				return fmt.Errorf("committed input = %q, want picked history entry", committed)
 			}
 			_ = stdinWriter.Close()
 			return nil

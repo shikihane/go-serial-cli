@@ -128,6 +128,10 @@ func shellConsoleKeyBytes(event keyEventRecord) []byte {
 		return []byte{0x1b, '[', 'C'}
 	case vkLeft:
 		return []byte{0x1b, '[', 'D'}
+	case vkTab:
+		if event.ControlKeyState&shiftPressed != 0 {
+			return []byte{0x1b, '[', 'Z'}
+		}
 	}
 	if event.UnicodeChar == 0 {
 		return nil
@@ -136,11 +140,13 @@ func shellConsoleKeyBytes(event keyEventRecord) []byte {
 }
 
 const (
-	keyEvent = 0x0001
-	vkLeft   = 0x25
-	vkUp     = 0x26
-	vkRight  = 0x27
-	vkDown   = 0x28
+	keyEvent     = 0x0001
+	shiftPressed = 0x0010
+	vkTab        = 0x09
+	vkLeft       = 0x25
+	vkUp         = 0x26
+	vkRight      = 0x27
+	vkDown       = 0x28
 )
 
 type inputRecord struct {

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"go-serial-cli/internal/picker"
 	"go-serial-cli/internal/serialcmd"
@@ -884,16 +885,16 @@ func (a *App) runShell(args []string, out io.Writer) error {
 		if usingDefaultStdin {
 			input = shellConsoleInput(input)
 		}
-		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath)
+		if a.deps.TerminalWidth != nil {
+			terminal := out
+			hooks.width = func() int { return a.deps.TerminalWidth(terminal) }
+		}
+		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath, hooks.width)
 		defer cleanup()
 		if restoreConsole != nil {
 			defer restoreConsole()
 		}
 		hooks.active, hooks.rawKeys = state.setTransfer, state.setRawKeys
-		if a.deps.TerminalWidth != nil {
-			terminal := out
-			hooks.width = func() int { return a.deps.TerminalWidth(terminal) }
-		}
 		input = wrappedInput
 		out = wrappedOutput
 	}
@@ -1281,6 +1282,10 @@ const shellCompletionCaptureWindow = 500 * time.Millisecond
 
 const shellCompletionCaptureLimit = 32 * 1024
 
+// shellMenuMaxRows is how many completion candidates the menu under the
+// prompt shows at once; the selection scrolls through the rest.
+const shellMenuMaxRows = 8
+
 // shellPromptRedrawDelay is the idle window used to debounce the forced
 // newline and prompt redraw after serial output that does not end with a
 // line break. Serial drivers often deliver one continuous print as several
@@ -1293,10 +1298,11 @@ const shellPromptRedrawDelay = 100 * time.Millisecond
 // to the transfer and never counts toward leaving the shell, and the
 // input prompt is not redrawn over the progress line. Raw keys pass keys
 // on with no echo while the transfer panel is shown.
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string) (io.Reader, io.Writer, func(), *shellInputState) {
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string, width func() int) (io.Reader, io.Writer, func(), *shellInputState) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
 	state := newShellInputState(echo, historyPath)
+	state.width = width
 	state.prompt()
 	var notifyCh chan os.Signal
 	signalCh := interrupts
@@ -1383,29 +1389,35 @@ func copyShellInput(writer *io.PipeWriter, input io.Reader, stop <-chan struct{}
 }
 
 type shellInputState struct {
-	mu                sync.Mutex
-	inputWriteMu      sync.Mutex
-	lastCtrlC         time.Time
-	echo              io.Writer
-	historyPath       string
-	history           []string
-	historyIndex      int
-	line              []byte
-	cursor            int
-	esc               []byte
-	escapeGen         uint64
-	escapeTimer       *time.Timer
-	completionGen     uint64
-	completionTimer   *time.Timer
-	completionActive  bool
-	completionOutput  []byte
-	deviceCompletions []string
-	prompted          bool
-	promptVisible     bool
-	partialPending    bool
-	redrawGen         uint64
-	redrawTimer       *time.Timer
-	transfer          bool
+	mu               sync.Mutex
+	inputWriteMu     sync.Mutex
+	lastCtrlC        time.Time
+	echo             io.Writer
+	historyPath      string
+	history          []string
+	historyIndex     int
+	line             []byte
+	cursor           int
+	esc              []byte
+	escapeGen        uint64
+	escapeTimer      *time.Timer
+	completionGen    uint64
+	completionTimer  *time.Timer
+	completionActive bool
+	completionOutput []byte
+	// menu holds the candidates the last Tab offered, menuIndex the
+	// selected one, and menuRows the rows the drawn menu takes below the
+	// prompt line.
+	menu           []string
+	menuIndex      int
+	menuRows       int
+	width          func() int
+	prompted       bool
+	promptVisible  bool
+	partialPending bool
+	redrawGen      uint64
+	redrawTimer    *time.Timer
+	transfer       bool
 	// rawKeys passes keys on as typed, with no echo or editing, while the
 	// transfer panel owns the screen.
 	rawKeys bool
@@ -1480,7 +1492,15 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 				return writer.Close()
 			}
 			s.lastCtrlC = now
+			menuOpen := len(s.menu) > 0
 			s.discardDeviceCompletionsLocked()
+			if menuOpen {
+				s.redraw()
+			}
+		}
+		if (ch == '\r' || ch == '\n') && len(s.menu) > 0 {
+			s.acceptMenuLocked()
+			continue
 		}
 		if ch == '\r' || ch == '\n' {
 			s.newline()
@@ -1498,17 +1518,24 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			if s.cursor > 0 {
 				s.line = append(s.line[:s.cursor-1], s.line[s.cursor:]...)
 				s.cursor--
+				s.menu = nil
 				s.redraw()
 			}
 			continue
 		}
 		if ch == '\t' {
+			if len(s.menu) > 0 {
+				s.moveMenuLocked(1)
+				continue
+			}
 			prefix := string(s.line)
 			if !strings.ContainsAny(prefix, " \t\r\n") {
 				s.startCompletionCaptureLocked()
 				writes = append(writes, []byte{ch})
 			} else {
 				s.discardDeviceCompletionsLocked()
+				s.openMenuLocked(s.historyCandidates(prefix))
+				s.redraw()
 			}
 			continue
 		}
@@ -1525,6 +1552,7 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		s.line[s.cursor] = ch
 		s.cursor++
 		s.historyIndex = len(s.history)
+		s.menu = nil
 		s.redraw()
 	}
 	if len(writes) == 0 {
@@ -1551,6 +1579,11 @@ func (s *shellInputState) setTransfer(active bool) {
 	s.lastCtrlC = time.Time{}
 	s.cancelPartialPendingLocked()
 	s.discardDeviceCompletionsLocked()
+	if active && s.menuRows > 0 && s.echo != nil {
+		_, _ = s.echo.Write([]byte("\r\x1b[J"))
+		s.menuRows = 0
+		s.promptVisible = false
+	}
 	if !active {
 		s.line = s.line[:0]
 		s.cursor = 0
@@ -1601,7 +1634,12 @@ func (s *shellInputState) writeOutput(data []byte) (int, error) {
 	// partial serial output the line ends with device data; erasing then
 	// would delete that data.
 	if s.promptVisible {
-		if _, err := s.echo.Write([]byte("\r\x1b[2K")); err != nil {
+		erase := "\r\x1b[2K"
+		if s.menuRows > 0 {
+			erase = "\r\x1b[J"
+			s.menuRows = 0
+		}
+		if _, err := s.echo.Write([]byte(erase)); err != nil {
 			return 0, err
 		}
 		s.promptVisible = false
@@ -1656,8 +1694,12 @@ func (s *shellInputState) startCompletionCaptureLocked() {
 		}
 		s.completionActive = false
 		s.completionTimer = nil
-		s.deviceCompletions = parseShellCompletionCandidates(s.completionOutput)
+		device := parseShellCompletionCandidates(s.completionOutput)
 		s.completionOutput = s.completionOutput[:0]
+		if s.transfer {
+			return
+		}
+		s.openMenuLocked(s.completionCandidates(string(s.line), device))
 		if s.prompted {
 			s.flushPartialPendingLocked()
 			s.redraw()
@@ -1684,14 +1726,14 @@ func (s *shellInputState) stopCompletionTimer() {
 	s.discardDeviceCompletionsLocked()
 }
 
-// discardDeviceCompletionsLocked makes device-derived suggestions one-shot
-// and prevents an older capture timer from publishing into a later input line.
-// Callers must hold s.mu.
+// discardDeviceCompletionsLocked makes device-derived suggestions one-shot,
+// closes the candidate menu, and prevents an older capture timer from
+// publishing into a later input line. Callers must hold s.mu.
 func (s *shellInputState) discardDeviceCompletionsLocked() {
 	s.completionGen++
 	s.completionActive = false
 	s.completionOutput = s.completionOutput[:0]
-	s.deviceCompletions = nil
+	s.menu = nil
 	if s.completionTimer != nil {
 		s.completionTimer.Stop()
 		s.completionTimer = nil
@@ -1847,6 +1889,12 @@ func (s *shellInputState) scheduleEscapeFlushLocked(writer *io.PipeWriter) {
 		pending := append([]byte(nil), s.esc...)
 		s.esc = s.esc[:0]
 		s.escapeTimer = nil
+		if len(pending) == 1 && len(s.menu) > 0 {
+			s.menu = nil
+			s.redraw()
+			s.mu.Unlock()
+			return
+		}
 		payload := s.takeImmediateInputLocked(pending)
 		s.inputWriteMu.Lock()
 		s.mu.Unlock()
@@ -1873,6 +1921,17 @@ func (s *shellInputState) stopEscapeTimer() {
 func (s *shellInputState) handleArrow(prefix byte, key byte) bool {
 	if prefix != '[' && prefix != 'O' {
 		return false
+	}
+	if len(s.menu) > 0 {
+		switch key {
+		case 'A', 'D', 'Z':
+			s.moveMenuLocked(-1)
+		case 'B', 'C':
+			s.moveMenuLocked(1)
+		default:
+			return false
+		}
+		return true
 	}
 	switch key {
 	case 'A':
@@ -1912,18 +1971,130 @@ func (s *shellInputState) redraw() {
 	if s.echo == nil {
 		return
 	}
-	_, _ = s.echo.Write([]byte("\r\x1b[2K>> "))
-	_, _ = s.echo.Write(s.line)
+	var b strings.Builder
+	b.WriteString("\r\x1b[2K>> ")
+	b.Write(s.line)
 	suffix := s.suggestionSuffix()
 	if suffix != "" {
-		_, _ = s.echo.Write([]byte("\x1b[90m"))
-		_, _ = s.echo.Write([]byte(suffix))
-		_, _ = s.echo.Write([]byte("\x1b[0m"))
+		b.WriteString("\x1b[90m" + suffix + "\x1b[0m")
 	}
-	if back := len(s.line) - s.cursor + len(suffix); back > 0 {
-		_, _ = fmt.Fprintf(s.echo, "\x1b[%dD", back)
+	rows := s.menuRowsLocked()
+	if s.menuRows > 0 || len(rows) > 0 {
+		b.WriteString("\x1b[J")
 	}
+	for _, row := range rows {
+		b.WriteString("\r\n" + row)
+	}
+	if len(rows) > 0 {
+		// Back up to the prompt line; relative moves stay right even when
+		// the menu scrolled the screen.
+		fmt.Fprintf(&b, "\x1b[%dA\r\x1b[%dC", len(rows), 3+utf8.RuneCount(s.line[:s.cursor]))
+	} else if back := len(s.line) - s.cursor + len(suffix); back > 0 {
+		fmt.Fprintf(&b, "\x1b[%dD", back)
+	}
+	s.menuRows = len(rows)
+	_, _ = s.echo.Write([]byte(b.String()))
 	s.promptVisible = true
+}
+
+// menuRowsLocked renders the visible window of the candidate menu, the
+// selection in reverse video, fitted to the terminal width.
+func (s *shellInputState) menuRowsLocked() []string {
+	if len(s.menu) == 0 {
+		return nil
+	}
+	width := 80
+	if s.width != nil {
+		if w := s.width(); w > 0 {
+			width = w
+		}
+	}
+	start := 0
+	if s.menuIndex >= shellMenuMaxRows {
+		start = s.menuIndex - shellMenuMaxRows + 1
+	}
+	end := min(start+shellMenuMaxRows, len(s.menu))
+	rows := make([]string, 0, end-start+1)
+	for i := start; i < end; i++ {
+		item := []rune(s.menu[i])
+		if limit := width - 4; len(item) > limit {
+			item = append(item[:max(limit-3, 0)], []rune("...")...)
+		}
+		if i == s.menuIndex {
+			rows = append(rows, "\x1b[7m "+string(item)+" \x1b[0m")
+		} else {
+			rows = append(rows, " "+string(item))
+		}
+	}
+	if len(s.menu) > shellMenuMaxRows {
+		rows = append(rows, fmt.Sprintf("\x1b[90m (%d/%d)\x1b[0m", s.menuIndex+1, len(s.menu)))
+	}
+	return rows
+}
+
+// openMenuLocked offers items for the current line. A single candidate
+// is filled in at once; the caller redraws.
+func (s *shellInputState) openMenuLocked(items []string) {
+	s.menu, s.menuIndex = nil, 0
+	switch len(items) {
+	case 0:
+	case 1:
+		s.line = []byte(items[0])
+		s.cursor = len(s.line)
+		s.historyIndex = len(s.history)
+	default:
+		s.menu = items
+	}
+}
+
+func (s *shellInputState) moveMenuLocked(delta int) {
+	s.menuIndex = (s.menuIndex + delta + len(s.menu)) % len(s.menu)
+	s.redraw()
+}
+
+// acceptMenuLocked fills the selected candidate into the line for more
+// editing; it is not sent until the next Enter.
+func (s *shellInputState) acceptMenuLocked() {
+	s.line = []byte(s.menu[s.menuIndex])
+	s.cursor = len(s.line)
+	s.historyIndex = len(s.history)
+	s.menu = nil
+	s.redraw()
+}
+
+// completionCandidates lists device candidates and then history entries
+// that extend prefix, without repeats. An empty line offers nothing.
+func (s *shellInputState) completionCandidates(prefix string, device []string) []string {
+	if prefix == "" {
+		return nil
+	}
+	var items []string
+	seen := map[string]bool{}
+	for _, item := range append(device, s.historyCandidates(prefix)...) {
+		if item != prefix && strings.HasPrefix(item, prefix) && !seen[item] {
+			seen[item] = true
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+// historyCandidates lists history entries that extend prefix, most
+// recent first, without repeats.
+func (s *shellInputState) historyCandidates(prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	var items []string
+	seen := map[string]bool{}
+	for i := len(s.history) - 1; i >= 0; i-- {
+		item := s.history[i]
+		if item != prefix && strings.HasPrefix(item, prefix) && !seen[item] {
+			seen[item] = true
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func (s *shellInputState) moveCursorLeft() {
@@ -1995,26 +2166,14 @@ func (s *shellInputState) suggestionSuffix() string {
 
 func (s *shellInputState) suggestedLine() string {
 	prefix := string(s.line)
+	if len(s.menu) > 0 {
+		return s.menu[s.menuIndex]
+	}
 	if prefix == "" {
 		return ""
 	}
-	if item := s.deviceSuggestedLine(prefix); item != "" {
-		return item
-	}
 	for i := len(s.history) - 1; i >= 0; i-- {
 		item := s.history[i]
-		if item != prefix && strings.HasPrefix(item, prefix) {
-			return item
-		}
-	}
-	return ""
-}
-
-func (s *shellInputState) deviceSuggestedLine(prefix string) string {
-	if prefix == "" || strings.ContainsAny(prefix, " \t\r\n") {
-		return ""
-	}
-	for _, item := range s.deviceCompletions {
 		if item != prefix && strings.HasPrefix(item, prefix) {
 			return item
 		}

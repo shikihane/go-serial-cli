@@ -480,14 +480,17 @@ The first line has the direction (↑ to the device, ↓ from it), the file name
 `sio shell` connects to the running named session in the foreground, prints serial
 output, and writes submitted lines to the port. It shows an internal `>>` prompt,
 stores per-session command history in `history.log`, supports Up/Down recall,
-and shows the nearest completion in gray; press Right to accept it. Each
-top-level Tab keeps the input prefix local, discards earlier device candidates,
-sends one bare Tab, and collects the next 500 milliseconds of visible device
-output as best-effort candidates. The local prompt is redrawn after that window
+and shows the most recent matching history entry in gray; press Right to accept
+it. Tab opens a menu of candidates below the prompt. For a top-level word, Tab
+keeps the prefix local, sends one bare Tab, collects the next 500 milliseconds
+of visible device output as best-effort candidates, and then lists them
+followed by matching history entries. For input containing whitespace, such as
+`lnx record `, Tab lists every matching history entry at once. In the menu,
+Tab, Up/Down or Left/Right move the selection, Enter fills it into the line
+(press Enter again to send), and Escape closes the menu. A single candidate is
+filled in directly. The local prompt is redrawn after the capture window
 instead of being inserted between response chunks. Device candidates are
-one-shot for the current input line and are discarded when another Tab starts,
-the suggestion is accepted, or the line is submitted or cancelled. Input
-containing whitespace continues to use history completion.
+one-shot for the current input line.
 Entered lines use the same default CRLF line behavior as `send` and `ask`.
 Ctrl+D and other non-editing control keys are forwarded immediately, sending and
 clearing any pending local prefix first. A standalone Escape is forwarded after

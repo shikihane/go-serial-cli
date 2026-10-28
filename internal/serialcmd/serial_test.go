@@ -1319,12 +1319,13 @@ func waitForFileContent(t *testing.T, path string, want string) {
 }
 
 type memorySerialPort struct {
-	mu       sync.Mutex
-	written  strings.Builder
-	writtenC chan struct{}
-	readC    chan []byte
-	closeC   chan struct{}
-	closed   bool
+	mu          sync.Mutex
+	written     strings.Builder
+	writtenC    chan struct{}
+	readC       chan []byte
+	closeC      chan struct{}
+	closed      bool
+	readTimeout time.Duration
 }
 
 func newMemorySerialPort() *memorySerialPort {
@@ -1336,12 +1337,32 @@ func newMemorySerialPort() *memorySerialPort {
 }
 
 func (p *memorySerialPort) Read(buf []byte) (int, error) {
+	p.mu.Lock()
+	timeout := p.readTimeout
+	p.mu.Unlock()
+	var timeoutC <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutC = timer.C
+	}
 	select {
 	case data := <-p.readC:
 		return copy(buf, data), nil
 	case <-p.closeC:
 		return 0, io.EOF
+	case <-timeoutC:
+		return 0, nil
 	}
+}
+
+// SetReadTimeout makes Read return every timeout, as go.bug.st/serial does, so
+// a port lease can close the port while no read is pending.
+func (p *memorySerialPort) SetReadTimeout(timeout time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readTimeout = timeout
+	return nil
 }
 
 func (p *memorySerialPort) Write(data []byte) (int, error) {

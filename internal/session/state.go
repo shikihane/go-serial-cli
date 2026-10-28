@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -132,7 +133,10 @@ func (s Store) Stop(name string) error {
 	state.CheckOffset = 0
 	state.WorkerPID = 0
 	state.HubPID = 0
-	return s.Save(state)
+	if err := s.Save(state); err != nil {
+		return err
+	}
+	return s.ClearPortReleased(name)
 }
 
 func (s Store) Remove(name string) error {
@@ -156,6 +160,44 @@ func (s Store) TxCachePath(name string) string {
 
 func (s Store) TxCacheIndexPath(name string) string {
 	return filepath.Join(s.SessionDir(name), "tx.index.jsonl")
+}
+
+// PortReleasedPath is the marker a session worker creates while it holds the
+// serial port closed so another program can use it, and removes when it
+// reopens the port. sio status, send, ask, sz and rz read it; the worker owns
+// it.
+func (s Store) PortReleasedPath(name string) string {
+	return filepath.Join(s.SessionDir(name), "port.released")
+}
+
+func (s Store) MarkPortReleased(name string) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.SessionDir(name), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.PortReleasedPath(name), []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644)
+}
+
+func (s Store) ClearPortReleased(name string) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	if err := os.Remove(s.PortReleasedPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// PortReleased reports the marker without loading state.json, so a released
+// port is visible even when the worker changes nothing else.
+func (s Store) PortReleased(name string) bool {
+	if err := ValidateName(name); err != nil {
+		return false
+	}
+	_, err := os.Stat(s.PortReleasedPath(name))
+	return err == nil
 }
 
 func (s Store) SessionDir(name string) string {

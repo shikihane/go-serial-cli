@@ -129,7 +129,7 @@ flowchart LR
 
 - 读取代理看到的同一份缓存输出。
 - 设备需要手动恢复时，用 `sio shell dev1` 介入。
-- 在烧录或 flash 前，用 `sio pause dev1` 标记需要独占访问。
+- 在烧录或 flash 前，用 `sio pause dev1` 把串口交出去，另一个工具才能真正打开它。
 - 当代理报告失败时，检查 `sio status dev1` 和 `sio log dev1`。
 - 用普通 CLI 命令修改会话，而不是编辑隐藏状态。
 
@@ -400,6 +400,8 @@ sio share dev1 COM20 COM21
 
 `sio shell` 在前台保持命名会话打开，打印串口输出，并把提交的输入行写入串口。它会显示内部 `>>` 提示符，把每个 session 的命令历史保存到 `history.log`，支持上/下方向键召回历史，并用灰色显示最近的补全；按右方向键接受补全。每次在顶层命令输入中按 Tab，`sio` 都会保留本地前缀、丢弃旧设备候选、只向设备发送一个裸 Tab，并把随后 500 毫秒内仍正常显示的设备输出作为尽力而为的候选；本地提示符会在窗口结束后统一重绘，不会插入设备输出分块之间。设备候选只服务当前输入行；下一次 Tab、按右方向键接受候选、提交或取消输入时都会丢弃。输入中已经包含空白时仍只使用历史补全。输入行使用和 `send`、`ask` 相同的默认 CRLF 行模式。Ctrl+D 和其他非编辑控制键会立即透传，并先发送、再清空已有的本地输入前缀。单独按下 ESC 时，会经过一个用于区分方向键序列的短暂窗口后透传；方向键和 Backspace 仍用于本地编辑。在 Windows 上，按一次 Ctrl+C 会向设备发送字节 `0x03`；短时间内第二次中断会退出 shell。
 
+Shift+Tab 与其他可编辑按键保持不变。在 `sio shell` 里，Ctrl+L 清屏（终端支持时一并清回滚区）并重绘提示符。Ctrl+S 把串口让给别的程序：session worker 关闭端口句柄但继续运行，`cache.log`、`sio read` 和 shell 都不受影响，另一个程序可以直接打开该端口。让出期间发给设备的按键会被丢弃并提示一次，`sio send`、`ask`、`sz`、`rz` 会以“端口已让出”报错。Ctrl+R 用会话保存的端口名和波特率重新打开端口；另一个程序仍占用时直接显示驱动错误。关闭端口会拉低 DTR，DTR 复位的板子会因此重启，驱动缓冲里未读的字节也会丢。这两个键需要运行中的 session worker，`sio share` 会话不绑定；旧版本启动的 worker 收不到请求字节，shell 只给提示，需要 `sio stop` 后 `sio open` 重启。
+
 `sio tee` 在前台保持端口打开，并把串口输出写到终端、指定文件和会话缓存。
 
 `sio tcp` 启动后台 worker，接受 TCP 客户端并桥接到命名串口会话。
@@ -429,9 +431,11 @@ sio stop dev1
 sio rm dev1
 ```
 
-`pause` 和 `resume` 更新本地会话状态，用于需要临时独占访问的工作流，例如烧录或 flash。
+`pause` 把串口交给别的程序，用于烧录或 flash 这类需要临时独占的工作流：session worker 关闭端口句柄（和 `sio shell` 里 Ctrl+S 用的是同一套租约）但继续运行，缓存、`status` 和已连接的 shell 都保留，另一个程序可以直接打开端口。会话被标记为 paused，`send`、`ask`、`sz`、`rz`、`shell`、`tee` 在 `resume` 前全部拒绝。没有运行中的 worker 时 `pause` 只做标记，因为端口本来就是空闲的。关闭端口会拉低 DTR，DTR 复位的板子会重启，`resume` 重新打开时再重启一次。share 会话会被拒绝（应先 `stop`），旧版本启动的 worker 无法释放端口也会被拒绝。已连接的 `sio shell` 继续显示设备输出，期间的按键被丢弃并提示一次；它里面的 Ctrl+R 会在会话仍为 paused 时先把端口取回来。
 
-`status` 报告已保存资源和 PID 存活状态：`running`、`stale` 或 `stopped`。`stale` 表示状态里保存了 PID，但对应进程已经不存在。`sio stop dev1` 仍然应该安全，并且只清理 `dev1`。
+`resume` 让 worker 重新打开端口。另一个程序仍占着端口时 `resume` 失败、会话保持 paused，等对方关闭后再次 `resume` 即可。没有运行中的 worker 时 `resume` 只清除标记。
+
+`status` 报告已保存资源和 PID 存活状态：`running`、`stale` 或 `stopped`；用 Ctrl+S 让出端口的会话会多一行 `port_state: released`。`stale` 表示状态里保存了 PID，但对应进程已经不存在。`sio stop dev1` 仍然应该安全，并且只清理 `dev1`。
 
 ## 设计目标
 
@@ -575,7 +579,10 @@ flowchart LR
 state.json
 cache.log
 worker.log
+port.released
 ```
+
+`port.released` 只在 worker 因 `sio shell` 把端口让给别的程序而关闭端口时存在；端口重开或 worker 退出时删除。
 
 使用 `sio log <session>` 查看 `worker.log`，并用它诊断会话和 share worker。
 

@@ -58,6 +58,8 @@ type AppDeps struct {
 	StreamSerial          func(opts serialcmd.StreamOptions) error
 	StreamSession         func(address string, input io.Reader, output io.Writer) error
 	StreamShell           func(opts serialcmd.ShellStreamOptions) error
+	ReleaseSessionPort    func(address string) error
+	AcquireSessionPort    func(address string) error
 	TransferZModem        func(opts serialcmd.ZModemOptions) error
 	FilePicker            func() serialcmd.FilePicker
 	IsProcessRunning      func(pid int) bool
@@ -92,6 +94,23 @@ func (a *App) usage(command string) error {
 
 func (a *App) pausedSessionError() error {
 	return fmt.Errorf("%w; run %s resume first", ErrSessionPaused, a.commandName())
+}
+
+// sessionPortReleased reports a port the session worker closed so another
+// program can use it from sio shell.
+func (a *App) sessionPortReleased(state session.State) bool {
+	if a.deps.Store.Dir == "" || state.WorkerPID == 0 || !a.deps.Store.PortReleased(state.Name) {
+		return false
+	}
+	if a.deps.IsProcessRunning != nil && !a.deps.IsProcessRunning(state.WorkerPID) {
+		return false
+	}
+	return true
+}
+
+func (a *App) releasedPortError(state session.State) error {
+	return fmt.Errorf("session %s released %s for another program; press Ctrl+R in %s shell %s, or run %s stop %s and %s open %s %s",
+		state.Name, state.Port, a.commandName(), state.Name, a.commandName(), state.Name, a.commandName(), state.Name, state.Port)
 }
 
 func (a *App) sharedControlUnavailable() error {
@@ -220,6 +239,8 @@ func DefaultDeps() (AppDeps, error) {
 		StreamSerial:          serialcmd.Stream,
 		StreamSession:         serialcmd.StreamSession,
 		StreamShell:           serialcmd.StreamShell,
+		ReleaseSessionPort:    serialcmd.ReleaseSessionPort,
+		AcquireSessionPort:    serialcmd.AcquireSessionPort,
 		TransferZModem:        serialcmd.TransferZModem,
 		FilePicker:            picker.New,
 		IsProcessRunning:      isProcessRunning,
@@ -404,6 +425,7 @@ func (a *App) runOpen(args []string, out io.Writer) error {
 			}
 		}
 		state := session.State{Name: name, Port: port, Baud: baud, Status: session.StatusConfigured, RawMode: rawMode}
+		_ = a.deps.Store.ClearPortReleased(name)
 		if a.deps.ReserveControlAddress != nil {
 			controlAddress, err := a.deps.ReserveControlAddress()
 			if err != nil {
@@ -486,6 +508,9 @@ func (a *App) runSend(args []string, out io.Writer) error {
 		}
 		if state.Paused {
 			return a.pausedSessionError()
+		}
+		if a.sessionPortReleased(state) {
+			return a.releasedPortError(state)
 		}
 		payload = payload.withSessionMode(state.RawMode)
 		if address, ok, err := sessionDialAddress(state); err != nil {
@@ -622,6 +647,9 @@ func (a *App) runAsk(args []string, out io.Writer) error {
 	}
 	if state.Paused {
 		return a.pausedSessionError()
+	}
+	if a.sessionPortReleased(state) {
+		return a.releasedPortError(state)
 	}
 	payload = payload.withSessionMode(state.RawMode)
 	if address, ok, err := sessionDialAddress(state); err != nil {
@@ -889,7 +917,7 @@ func (a *App) runShell(args []string, out io.Writer) error {
 			terminal := out
 			hooks.width = func() int { return a.deps.TerminalWidth(terminal) }
 		}
-		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath, hooks.width)
+		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath, hooks.width, a.shellPortLease(name))
 		defer cleanup()
 		if restoreConsole != nil {
 			defer restoreConsole()
@@ -899,6 +927,70 @@ func (a *App) runShell(args []string, out io.Writer) error {
 		out = wrappedOutput
 	}
 	return a.runShellStream(name, input, out, autoTransfer, hooks)
+}
+
+// shellLease lets sio shell lend the session's serial port to another program
+// and take it back. The worker keeps running: only the port handle closes.
+type shellLease struct {
+	address string
+	port    string
+	baud    int
+	release func(address string) error
+	acquire func(address string) error
+	// available is false for a worker from an older build: it would forward
+	// the request bytes to the device and never answer.
+	available bool
+	hint      string
+}
+
+// shellPortLease returns the lease for a session whose worker owns the port.
+// A share session runs a different worker that has no lease, so its shell
+// leaves Ctrl+S and Ctrl+R to the device.
+func (a *App) shellPortLease(name string) *shellLease {
+	if a.deps.Store.Dir == "" || a.deps.StreamShell == nil {
+		return nil
+	}
+	if a.deps.ReleaseSessionPort == nil || a.deps.AcquireSessionPort == nil {
+		return nil
+	}
+	state, err := a.deps.Store.Load(name)
+	if err != nil || state.Paused || state.Status == session.StatusSharing {
+		return nil
+	}
+	address, ok, err := sessionDialAddress(state)
+	if err != nil || !ok {
+		return nil
+	}
+	return &shellLease{
+		address:   address,
+		port:      state.Port,
+		baud:      state.Baud,
+		release:   a.deps.ReleaseSessionPort,
+		acquire:   a.deps.AcquireSessionPort,
+		available: a.workerPortLeaseSupport(state),
+		hint:      fmt.Sprintf("this session worker predates port release; run %s stop %s and %s open %s %s", a.commandName(), state.Name, a.commandName(), state.Name, state.Port),
+	}
+}
+
+// workerPortLeaseSupport reports whether the running worker advertised port
+// lease support when it started. Only then may the shell send a release
+// request: an older worker treats it as device input and never answers.
+func (a *App) workerPortLeaseSupport(state session.State) bool {
+	if state.WorkerPID == 0 || a.deps.Store.Dir == "" || state.Status == session.StatusSharing {
+		return false
+	}
+	content, err := os.ReadFile(a.deps.Store.WorkerLogPath(state.Name))
+	if err != nil {
+		return false
+	}
+	marker := fmt.Sprintf("worker start mode=%s pid=%d", workerModeForState(state), state.WorkerPID)
+	supported := false
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.Contains(line, marker) {
+			supported = strings.Contains(line, "portlease=1")
+		}
+	}
+	return supported
 }
 
 // shellTransferHooks let a transfer the shell detects take the keyboard
@@ -1101,6 +1193,9 @@ func (a *App) sessionForTransfer(name string) (session.State, error) {
 	if state.Paused {
 		return session.State{}, a.pausedSessionError()
 	}
+	if a.sessionPortReleased(state) {
+		return session.State{}, a.releasedPortError(state)
+	}
 	return state, nil
 }
 
@@ -1298,10 +1393,10 @@ const shellPromptRedrawDelay = 100 * time.Millisecond
 // to the transfer and never counts toward leaving the shell, and the
 // input prompt is not redrawn over the progress line. Raw keys pass keys
 // on with no echo while the transfer panel is shown.
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string, width func() int) (io.Reader, io.Writer, func(), *shellInputState) {
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string, width func() int, lease *shellLease) (io.Reader, io.Writer, func(), *shellInputState) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
-	state := newShellInputState(echo, historyPath)
+	state := newShellInputState(echo, historyPath, lease)
 	state.width = width
 	state.prompt()
 	var notifyCh chan os.Signal
@@ -1421,6 +1516,11 @@ type shellInputState struct {
 	// rawKeys passes keys on as typed, with no echo or editing, while the
 	// transfer panel owns the screen.
 	rawKeys bool
+	// lease releases the serial port to another program while released is
+	// set; keys meant for the device are dropped and a hint is shown once.
+	lease        *shellLease
+	released     bool
+	releasedHint bool
 }
 
 type shellOutputWriter struct {
@@ -1434,13 +1534,14 @@ func (w shellOutputWriter) Write(data []byte) (int, error) {
 	return w.state.writeOutput(data)
 }
 
-func newShellInputState(echo io.Writer, historyPath string) *shellInputState {
+func newShellInputState(echo io.Writer, historyPath string, lease *shellLease) *shellInputState {
 	history := readShellHistory(historyPath)
 	return &shellInputState{
 		echo:         echo,
 		historyPath:  historyPath,
 		history:      history,
 		historyIndex: len(history),
+		lease:        lease,
 	}
 }
 
@@ -1456,7 +1557,12 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 	s.flushPartialPendingLocked()
 	s.prompt()
 	var writes [][]byte
+	var leaseAction func()
 	for _, ch := range data {
+		if s.released && !s.transfer && ch != 0x03 && ch != 0x0c && ch != 0x12 && ch != 0x13 {
+			s.dropWhileReleasedLocked()
+			continue
+		}
 		if len(s.esc) > 0 {
 			s.esc = append(s.esc, ch)
 			if len(s.esc) == 2 && (ch == '[' || ch == 'O') {
@@ -1475,6 +1581,41 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		if ch == 0x1b {
 			s.esc = append(s.esc[:0], ch)
 			s.scheduleEscapeFlushLocked(writer)
+			continue
+		}
+		if ch == 0x0c {
+			s.clearScreenLocked()
+			continue
+		}
+		if ch == 0x13 && s.lease != nil && !s.transfer {
+			if !s.lease.available {
+				s.noticeLocked("[sio: " + s.lease.hint + "]")
+				continue
+			}
+			if s.released {
+				s.noticeLocked("[sio: " + s.lease.port + " is released; Ctrl+R reopens it]")
+				continue
+			}
+			if leaseAction == nil {
+				s.released = true
+				s.releasedHint = false
+				s.dropLineLocked()
+				leaseAction = s.leaseRequest(true)
+			}
+			continue
+		}
+		if ch == 0x12 && s.lease != nil && !s.transfer {
+			if !s.lease.available {
+				s.noticeLocked("[sio: " + s.lease.hint + "]")
+				continue
+			}
+			if !s.released {
+				s.noticeLocked("[sio: " + s.lease.port + " is open; Ctrl+S releases it]")
+				continue
+			}
+			if leaseAction == nil {
+				leaseAction = s.leaseRequest(false)
+			}
 			continue
 		}
 		if ch == 0x03 && s.transfer {
@@ -1540,6 +1681,10 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 			continue
 		}
 		if ch == 0x03 {
+			if s.released {
+				s.dropWhileReleasedLocked()
+				continue
+			}
 			writes = append(writes, []byte{ch})
 			continue
 		}
@@ -1555,17 +1700,25 @@ func (s *shellInputState) write(writer *io.PipeWriter, data []byte) error {
 		s.menu = nil
 		s.redraw()
 	}
-	if len(writes) == 0 {
+	if len(writes) == 0 && leaseAction == nil {
 		s.mu.Unlock()
 		return nil
 	}
-	s.inputWriteMu.Lock()
-	s.mu.Unlock()
-	defer s.inputWriteMu.Unlock()
-	for _, payload := range writes {
-		if _, err := writer.Write(payload); err != nil {
-			return err
+	if len(writes) > 0 {
+		s.inputWriteMu.Lock()
+		s.mu.Unlock()
+		for _, payload := range writes {
+			if _, err := writer.Write(payload); err != nil {
+				s.inputWriteMu.Unlock()
+				return err
+			}
 		}
+		s.inputWriteMu.Unlock()
+	} else {
+		s.mu.Unlock()
+	}
+	if leaseAction != nil {
+		leaseAction()
 	}
 	return nil
 }
@@ -1606,6 +1759,117 @@ func (s *shellInputState) inTransfer() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.transfer
+}
+
+// clearScreenLocked clears the screen and, where the terminal supports it,
+// the scrollback, then draws the prompt again.
+func (s *shellInputState) clearScreenLocked() {
+	if s.echo == nil || s.transfer {
+		return
+	}
+	s.cancelEscapeFlushLocked()
+	s.esc = s.esc[:0]
+	s.menu = nil
+	s.menuRows = 0
+	s.promptVisible = false
+	s.prompted = false
+	_, _ = s.echo.Write([]byte("\x1b[H\x1b[2J\x1b[3J"))
+	s.prompt()
+	s.redraw()
+}
+
+// dropLineLocked forgets and erases the line being edited.
+func (s *shellInputState) dropLineLocked() {
+	s.line = s.line[:0]
+	s.cursor = 0
+	s.menu = nil
+	s.historyIndex = len(s.history)
+	s.discardDeviceCompletionsLocked()
+	if s.echo == nil {
+		return
+	}
+	erase := "\r\x1b[2K"
+	if s.menuRows > 0 {
+		erase = "\r\x1b[J"
+		s.menuRows = 0
+	}
+	s.promptVisible = false
+	s.prompted = false
+	_, _ = s.echo.Write([]byte(erase))
+	s.prompt()
+}
+
+// dropWhileReleasedLocked discards a key meant for a port that is lent out
+// and explains why once.
+func (s *shellInputState) dropWhileReleasedLocked() {
+	s.cancelEscapeFlushLocked()
+	s.esc = s.esc[:0]
+	if s.releasedHint || s.lease == nil {
+		return
+	}
+	s.releasedHint = true
+	s.noticeLocked("[sio: " + s.lease.port + " is released for another program; Ctrl+R reopens it]")
+}
+
+// noticeLocked prints a local notice above a fresh prompt.
+func (s *shellInputState) noticeLocked(text string) {
+	if s.echo == nil {
+		return
+	}
+	prefix := "\r\n"
+	if s.promptVisible {
+		prefix = "\r\x1b[2K"
+		if s.menuRows > 0 {
+			prefix = "\r\x1b[J"
+			s.menuRows = 0
+		}
+	}
+	s.menu = nil
+	s.promptVisible = false
+	s.prompted = false
+	_, _ = s.echo.Write([]byte(prefix + text + "\r\n"))
+	s.prompt()
+	s.redraw()
+}
+
+// leaseRequest returns the work that asks the worker to close or reopen the
+// port. It runs after the input state lock is released so a slow worker
+// cannot hold up device output.
+func (s *shellInputState) leaseRequest(release bool) func() {
+	lease := s.lease
+	return func() {
+		var err error
+		if release {
+			err = lease.release(lease.address)
+		} else {
+			err = lease.acquire(lease.address)
+		}
+		s.finishLease(release, err)
+	}
+}
+
+// finishLease keeps the local released flag in step with the worker. A
+// successful release or reopen is announced by the worker to every client,
+// including this shell's stream, so no local notice repeats it.
+func (s *shellInputState) finishLease(release bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if release {
+		s.released = err == nil
+	} else {
+		s.released = err != nil
+	}
+	if err != nil {
+		verb := "reopen"
+		if release {
+			verb = "release"
+		}
+		s.noticeLocked("[sio: " + s.lease.port + " " + verb + " failed: " + err.Error() + "]")
+		return
+	}
+	if !release {
+		s.releasedHint = false
+	}
 }
 
 func (s *shellInputState) takeImmediateInputLocked(control []byte) []byte {
@@ -2918,6 +3182,9 @@ func (a *App) stopLiveResources(state session.State) error {
 			stopErr = errors.Join(stopErr, err)
 		}
 	}
+	if a.deps.Store.Dir != "" {
+		_ = a.deps.Store.ClearPortReleased(state.Name)
+	}
 	return stopErr
 }
 
@@ -2954,6 +3221,25 @@ func (a *App) runWorkerAuto(name string, out io.Writer) error {
 	return a.runWorkerShare(name, out)
 }
 
+// portLeaseRecorder marks a released port in the session directory, so
+// status, send, ask, sz and rz can tell it is lent out, and logs the change to
+// worker.log.
+func (a *App) portLeaseRecorder(name string, port string, log func(string)) func(bool) {
+	return func(released bool) {
+		if released {
+			if err := a.deps.Store.MarkPortReleased(name); err != nil {
+				log("port lease mark error " + err.Error())
+			}
+			log("port released " + port)
+			return
+		}
+		if err := a.deps.Store.ClearPortReleased(name); err != nil {
+			log("port lease clear error " + err.Error())
+		}
+		log("port reopened " + port)
+	}
+}
+
 func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 	if err := session.ValidateName(name); err != nil {
 		return err
@@ -2969,8 +3255,10 @@ func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 	appendWorkerLog := func(line string) {
 		_ = session.AppendLog(logPath, line)
 	}
-	appendWorkerLog(fmt.Sprintf("worker start mode=session pid=%d control=%s", os.Getpid(), state.ControlAddress))
+	appendWorkerLog(fmt.Sprintf("worker start mode=session pid=%d control=%s portlease=1", os.Getpid(), state.ControlAddress))
+	_ = a.deps.Store.ClearPortReleased(name)
 	defer func() {
+		_ = a.deps.Store.ClearPortReleased(name)
 		if retErr != nil {
 			appendWorkerLog("worker error " + retErr.Error())
 		}
@@ -2992,13 +3280,14 @@ func (a *App) runWorkerSession(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.RunSessionServer(serialcmd.SessionServerOptions{
-			ControlAddress:   state.ControlAddress,
-			Port:             state.Port,
-			Baud:             state.Baud,
-			CachePath:        a.deps.Store.CachePath(name),
-			CacheIndexPath:   a.deps.Store.CacheIndexPath(name),
-			TxCachePath:      a.deps.Store.TxCachePath(name),
-			TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
+			ControlAddress:    state.ControlAddress,
+			Port:              state.Port,
+			Baud:              state.Baud,
+			CachePath:         a.deps.Store.CachePath(name),
+			CacheIndexPath:    a.deps.Store.CacheIndexPath(name),
+			TxCachePath:       a.deps.Store.TxCachePath(name),
+			TxCacheIndexPath:  a.deps.Store.TxCacheIndexPath(name),
+			OnPortLeaseChange: a.portLeaseRecorder(name, state.Port, appendWorkerLog),
 		})
 	})
 }
@@ -3092,8 +3381,10 @@ func (a *App) runWorkerTCP(name string, out io.Writer) (retErr error) {
 	appendWorkerLog := func(line string) {
 		_ = session.AppendLog(logPath, line)
 	}
-	appendWorkerLog(fmt.Sprintf("worker start mode=tcp pid=%d listen=%s", os.Getpid(), state.TCPAddress))
+	appendWorkerLog(fmt.Sprintf("worker start mode=tcp pid=%d listen=%s portlease=1", os.Getpid(), state.TCPAddress))
+	_ = a.deps.Store.ClearPortReleased(name)
 	defer func() {
+		_ = a.deps.Store.ClearPortReleased(name)
 		if retErr != nil {
 			appendWorkerLog("worker error " + retErr.Error())
 		}
@@ -3118,13 +3409,14 @@ func (a *App) runWorkerTCP(name string, out io.Writer) (retErr error) {
 	}
 	return a.runWorkerWithRetry(name, appendWorkerLog, func() error {
 		return a.deps.BridgeTCP(serialcmd.TCPBridgeOptions{
-			ListenAddress:    state.TCPAddress,
-			Port:             state.Port,
-			Baud:             state.Baud,
-			CachePath:        a.deps.Store.CachePath(name),
-			CacheIndexPath:   a.deps.Store.CacheIndexPath(name),
-			TxCachePath:      a.deps.Store.TxCachePath(name),
-			TxCacheIndexPath: a.deps.Store.TxCacheIndexPath(name),
+			ListenAddress:     state.TCPAddress,
+			Port:              state.Port,
+			Baud:              state.Baud,
+			CachePath:         a.deps.Store.CachePath(name),
+			CacheIndexPath:    a.deps.Store.CacheIndexPath(name),
+			TxCachePath:       a.deps.Store.TxCachePath(name),
+			TxCacheIndexPath:  a.deps.Store.TxCacheIndexPath(name),
+			OnPortLeaseChange: a.portLeaseRecorder(name, state.Port, appendWorkerLog),
 			OnListening: func(address string) {
 				appendWorkerLog("worker ready listen=" + address)
 			},
@@ -3299,47 +3591,131 @@ func (a *App) runPause(args []string, out io.Writer) error {
 	if len(args) != 1 {
 		return a.usage("pause <session>")
 	}
-	return a.setPaused(args[0], true, out)
+	return a.pauseSession(args[0], out)
 }
 
 func (a *App) runResume(args []string, out io.Writer) error {
 	if len(args) != 1 {
 		return a.usage("resume <session>")
 	}
-	return a.setPaused(args[0], false, out)
+	return a.resumeSession(args[0], out)
 }
 
-func (a *App) setPaused(name string, paused bool, out io.Writer) error {
+// pauseSession keeps sio off the serial port and hands the port to another
+// program: a running worker closes the handle but keeps running, so the
+// cache, status, and an attached shell stay in place. Without a worker the
+// port is already free, and pause only records that sio must not use it.
+func (a *App) pauseSession(name string, out io.Writer) error {
 	if err := session.ValidateName(name); err != nil {
 		return err
 	}
 	if a.deps.Store.Dir == "" {
-		if paused {
-			_, _ = fmt.Fprintf(out, "serial control paused for %s\n", name)
-		} else {
-			_, _ = fmt.Fprintf(out, "serial control resumed for %s\n", name)
-		}
+		_, _ = fmt.Fprintf(out, "paused %s\n", name)
 		return nil
 	}
 	state, err := a.deps.Store.Load(name)
 	if err != nil {
 		return err
 	}
-	state.Paused = paused
-	if paused {
-		state.Status = session.StatusPaused
-	} else if len(state.VirtualPorts) > 0 {
-		state.Status = session.StatusSharing
+	released := false
+	if processState(state.WorkerPID, a.deps.IsProcessRunning) == "running" {
+		if workerModeForState(state) == "share" {
+			return fmt.Errorf("pause %s: a sharing session also owns %s; run %s stop %s first",
+				name, strings.Join(state.VirtualPorts, ","), a.commandName(), name)
+		}
+		if !a.workerPortLeaseSupport(state) {
+			return fmt.Errorf("pause %s: the session worker predates port release; run %s stop %s and %s open %s %s",
+				name, a.commandName(), name, a.commandName(), name, state.Port)
+		}
+		address, ok, err := sessionDialAddress(state)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("pause %s: the session has no control channel; run %s stop %s first", name, a.commandName(), name)
+		}
+		if a.deps.ReleaseSessionPort == nil {
+			return errors.New("session port release is unavailable")
+		}
+		if err := a.deps.ReleaseSessionPort(address); err != nil {
+			return fmt.Errorf("pause %s: %w", name, err)
+		}
+		released = true
 	} else {
+		// No worker holds the port; drop a marker left by a worker that died
+		// while its port was released.
+		_ = a.deps.Store.ClearPortReleased(name)
+	}
+	state.Paused = true
+	state.Status = session.StatusPaused
+	if err := a.deps.Store.Save(state); err != nil {
+		return err
+	}
+	if released {
+		_, _ = fmt.Fprintf(out, "paused %s: %s released for another program\n", name, state.Port)
+	} else {
+		_, _ = fmt.Fprintf(out, "paused %s: no worker running\n", name)
+	}
+	return nil
+}
+
+// resumeSession gives sio the port back. While another program still holds
+// it the session stays paused, so the next resume can retry.
+func (a *App) resumeSession(name string, out io.Writer) error {
+	if err := session.ValidateName(name); err != nil {
+		return err
+	}
+	if a.deps.Store.Dir == "" {
+		_, _ = fmt.Fprintf(out, "resumed %s\n", name)
+		return nil
+	}
+	state, err := a.deps.Store.Load(name)
+	if err != nil {
+		return err
+	}
+	running := processState(state.WorkerPID, a.deps.IsProcessRunning) == "running"
+	released := a.deps.Store.PortReleased(name)
+	if running && released && !a.workerPortLeaseSupport(state) {
+		return fmt.Errorf("resume %s: the session worker predates port release; run %s stop %s and %s open %s %s",
+			name, a.commandName(), name, a.commandName(), name, state.Port)
+	}
+	reopened := false
+	if running && (state.Paused || released) && a.workerPortLeaseSupport(state) {
+		address, ok, err := sessionDialAddress(state)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("resume %s: the session has no control channel; run %s stop %s and %s open %s %s",
+				name, a.commandName(), name, a.commandName(), name, state.Port)
+		}
+		if a.deps.AcquireSessionPort == nil {
+			return errors.New("session port acquire is unavailable")
+		}
+		if err := a.deps.AcquireSessionPort(address); err != nil {
+			return fmt.Errorf("resume %s: the port is still held: %w; paused stays, close the other program and run %s resume %s again",
+				name, err, a.commandName(), name)
+		}
+		reopened = true
+	} else if !running {
+		_ = a.deps.Store.ClearPortReleased(name)
+	}
+	state.Paused = false
+	switch workerModeForState(state) {
+	case "share":
+		state.Status = session.StatusSharing
+	case "tcp":
+		state.Status = session.StatusTCP
+	default:
 		state.Status = session.StatusConfigured
 	}
 	if err := a.deps.Store.Save(state); err != nil {
 		return err
 	}
-	if paused {
-		_, _ = fmt.Fprintf(out, "serial control paused for %s\n", name)
+	if reopened {
+		_, _ = fmt.Fprintf(out, "resumed %s: %s open at %d baud\n", name, state.Port, state.Baud)
 	} else {
-		_, _ = fmt.Fprintf(out, "serial control resumed for %s\n", name)
+		_, _ = fmt.Fprintf(out, "resumed %s\n", name)
 	}
 	return nil
 }
@@ -3578,6 +3954,9 @@ func printState(out io.Writer, state session.State, store session.Store, isRunni
 		_, _ = fmt.Fprintf(out, "worker_pid: %d\n", state.WorkerPID)
 	}
 	_, _ = fmt.Fprintf(out, "worker_state: %s\n", processState(state.WorkerPID, isRunning))
+	if store.Dir != "" && state.WorkerPID != 0 && processState(state.WorkerPID, isRunning) == "running" && store.PortReleased(state.Name) {
+		_, _ = fmt.Fprintf(out, "port_state: released\n")
+	}
 	if store.Dir != "" && state.WorkerPID != 0 {
 		mode := workerModeForState(state)
 		startMarker := fmt.Sprintf("worker start mode=%s pid=%d", mode, state.WorkerPID)

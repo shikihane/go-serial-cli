@@ -59,6 +59,9 @@ type TCPBridgeOptions struct {
 	Stop             <-chan struct{}
 	OpenPort         func(port string, baud int) (SerialPort, error)
 	OnListening      func(address string)
+	// OnPortLeaseChange reports a port released to another program or taken
+	// back, so the caller can mark it in the session directory.
+	OnPortLeaseChange func(released bool)
 }
 
 type SessionServerOptions struct {
@@ -71,6 +74,9 @@ type SessionServerOptions struct {
 	TxCacheIndexPath string
 	Stop             <-chan struct{}
 	OpenPort         func(port string, baud int) (SerialPort, error)
+	// OnPortLeaseChange reports a port released to another program or taken
+	// back, so the caller can mark it in the session directory.
+	OnPortLeaseChange func(released bool)
 }
 
 type ShareBridgeOptions struct {
@@ -356,7 +362,8 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 	if err != nil {
 		return diag.SerialOpenError(opts.Port, err)
 	}
-	defer port.Close()
+	lease := newPortLease(port, opts.Port, opts.Baud, openPort, opts.OnPortLeaseChange)
+	defer lease.close()
 
 	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
@@ -379,7 +386,7 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 		opts.OnListening(listener.Addr().String())
 	}
 
-	server := newSessionServer(port, output, txOutput)
+	server := newSessionServer(lease, output, txOutput)
 	defer server.close()
 
 	errCh := make(chan error, 3)
@@ -399,7 +406,7 @@ func BridgeTCP(opts TCPBridgeOptions) error {
 		go func() {
 			<-opts.Stop
 			_ = listener.Close()
-			_ = port.Close()
+			lease.close()
 			server.closeClients()
 		}()
 	}
@@ -434,7 +441,8 @@ func RunSessionServer(opts SessionServerOptions) error {
 	if err != nil {
 		return diag.SerialOpenError(opts.Port, err)
 	}
-	defer port.Close()
+	lease := newPortLease(port, opts.Port, opts.Baud, openPort, opts.OnPortLeaseChange)
+	defer lease.close()
 
 	output, closeOutput, err := streamOutput(StreamOptions{Output: io.Discard, CachePath: opts.CachePath, CacheIndexPath: opts.CacheIndexPath})
 	if err != nil {
@@ -454,7 +462,7 @@ func RunSessionServer(opts SessionServerOptions) error {
 	}
 	defer listener.Close()
 
-	server := newSessionServer(port, output, txOutput)
+	server := newSessionServer(lease, output, txOutput)
 	defer server.close()
 
 	errCh := make(chan error, 2)
@@ -468,7 +476,7 @@ func RunSessionServer(opts SessionServerOptions) error {
 		go func() {
 			<-opts.Stop
 			_ = listener.Close()
-			_ = port.Close()
+			lease.close()
 			server.closeClients()
 		}()
 	}
@@ -642,7 +650,7 @@ func StreamSession(address string, input io.Reader, output io.Writer) error {
 }
 
 type sessionServer struct {
-	port     SerialPort
+	lease    *portLease
 	output   *asyncCapture
 	txOutput *asyncCapture
 	mu       sync.Mutex
@@ -672,12 +680,12 @@ type shareBridge struct {
 	closeOnce    sync.Once
 }
 
-func newSessionServer(port SerialPort, output io.Writer, txOutput io.Writer) *sessionServer {
+func newSessionServer(lease *portLease, output io.Writer, txOutput io.Writer) *sessionServer {
 	if txOutput == nil {
 		txOutput = io.Discard
 	}
 	return &sessionServer{
-		port:     port,
+		lease:    lease,
 		output:   newAsyncCapture(output),
 		txOutput: newAsyncCapture(txOutput),
 		clients:  map[net.Conn]struct{}{},
@@ -686,6 +694,7 @@ func newSessionServer(port SerialPort, output io.Writer, txOutput io.Writer) *se
 
 // close flushes the capture queues. Call it before the cache files close.
 func (s *sessionServer) close() {
+	s.lease.close()
 	s.closeClients()
 	s.output.Close()
 	s.txOutput.Close()
@@ -983,11 +992,18 @@ func (s *sessionServer) closeClients() {
 	}
 }
 
-func writeSerialAll(s *sessionServer, data []byte) error {
+// writeSerial writes through the leased port. It takes writeMu so a release
+// or acquire waits for an in-flight write instead of closing the handle under
+// it.
+func (s *sessionServer) writeSerial(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	port := s.lease.current()
+	if port == nil {
+		return errPortReleased
+	}
 	for len(data) > 0 {
-		s.writeMu.Lock()
-		n, err := s.port.Write(data)
-		s.writeMu.Unlock()
+		n, err := port.Write(data)
 		if n > 0 {
 			data = data[n:]
 		}
@@ -1012,7 +1028,8 @@ func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 	}()
 	label := "tcp:" + conn.RemoteAddr().String()
 	buf := make([]byte, 4096)
-	warned := false
+	claimWarned := false
+	leaseWarned := false
 	forward := func(data []byte) error {
 		if len(data) == 0 {
 			return nil
@@ -1020,26 +1037,46 @@ func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 		// Writes are dropped while another connection holds a file transfer
 		// claim. Say so once, so the user knows why keys do nothing.
 		if !s.claim.allows(conn) {
-			if !warned {
-				warned = true
+			if !claimWarned {
+				claimWarned = true
 				_, _ = conn.Write([]byte(transferClaimNotice))
 			}
 			return nil
 		}
-		warned = false
+		claimWarned = false
 		at := time.Now().Local()
-		if writeErr := writeSerialAll(s, data); writeErr != nil {
+		if writeErr := s.writeSerial(data); writeErr != nil {
+			if errors.Is(writeErr, errPortReleased) {
+				if !leaseWarned {
+					leaseWarned = true
+					_, _ = conn.Write([]byte(portReleasedNotice))
+				}
+				return nil
+			}
 			return fmt.Errorf("write serial port %s: %w", portName, writeErr)
 		}
+		leaseWarned = false
 		return captureTXChunk(s.txOutput, TimedChunk{At: at, Source: label, Data: data})
 	}
 
-	data, wantClaim, err := readClaim(conn, buf)
-	if wantClaim {
-		if !answerClaim(&s.claim, conn) {
+	data, request, err := readRequest(conn, buf, sessionServerRequests)
+	switch request {
+	case requestTransferClaim:
+		// Sharing writeMu with release and acquire keeps a transfer from
+		// claiming the port while it is being closed.
+		s.writeMu.Lock()
+		ok := answerClaim(&s.claim, conn)
+		s.writeMu.Unlock()
+		if !ok {
 			return nil
 		}
 		claimed = true
+	case requestPortRelease:
+		answerPortRequest(conn, s.releasePort(conn))
+		return nil
+	case requestPortAcquire:
+		answerPortRequest(conn, s.acquirePort(conn))
+		return nil
 	}
 	for {
 		if fwdErr := forward(append([]byte(nil), data...)); fwdErr != nil {
@@ -1054,10 +1091,54 @@ func (s *sessionServer) copyClientToPort(conn net.Conn, portName string) error {
 	}
 }
 
+// releasePort closes the port for another program. A transfer claim holds
+// the port for itself, so it also blocks a release.
+func (s *sessionServer) releasePort(conn net.Conn) error {
+	s.writeMu.Lock()
+	owner := s.claim.current()
+	var released bool
+	var err error
+	if owner == nil || owner == conn {
+		released, err = s.lease.release()
+	} else {
+		err = errors.New("a file transfer is using the port")
+	}
+	s.writeMu.Unlock()
+	if err != nil || !released {
+		return err
+	}
+	s.noticeOthers(conn, fmt.Sprintf("\r\n[sio: %s released for another program; Ctrl+R in sio shell to reopen]\r\n", s.lease.name))
+	return nil
+}
+
+func (s *sessionServer) acquirePort(conn net.Conn) error {
+	s.writeMu.Lock()
+	reopened, err := s.lease.acquire()
+	s.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if reopened {
+		s.noticeOthers(conn, fmt.Sprintf("\r\n[sio: %s reopened at %d baud]\r\n", s.lease.name, s.lease.baud))
+	}
+	return nil
+}
+
 func (s *sessionServer) copyPortToClients(portName string) error {
 	buf := make([]byte, 4096)
 	for {
-		n, err := s.port.Read(buf)
+		port := s.lease.waitPort()
+		if port == nil {
+			return nil
+		}
+		n, err := port.Read(buf)
+		// A release asked for the port while this read was in flight: close it
+		// here, where no read is pending, so the handle really is free.
+		if done, closing := s.lease.retire(port); closing {
+			return nil
+		} else if done {
+			continue
+		}
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			at := time.Now().Local()

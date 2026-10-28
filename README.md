@@ -172,7 +172,7 @@ The human is still in the loop:
 
 - read the same cached output the agent reads.
 - interrupt with `sio shell dev1` when the device needs a manual recovery step.
-- use `sio pause dev1` before a flash or burn step that needs exclusive access.
+- use `sio pause dev1` before a flash or burn step that needs exclusive access; it closes the port so the other tool can open it.
 - inspect `sio status dev1` and `sio log dev1` when the agent reports a failure.
 - modify the session with normal CLI commands instead of editing hidden state.
 
@@ -499,6 +499,19 @@ Backspace remain local editing keys. Exiting shell leaves the background worker
 running. On Windows, one Ctrl+C sends byte `0x03` to the device; a second
 interrupt shortly after exits the shell.
 
+Ctrl+L clears the screen (and the scrollback where the terminal supports it) and redraws the prompt. Ctrl+S lends the
+serial port to another program: the session worker closes the handle and keeps
+running, so `cache.log`, `sio read`, and the shell stay in place, and the other
+program can open the port. While it is lent out, keys meant for the device are
+dropped with one hint, and `sio send`, `ask`, `sz`, and `rz` refuse with a
+released-port error. Ctrl+R opens the port again with the session's port name
+and baud; it fails with the driver error while the other program still holds
+it. Closing the port drops DTR, so a board that resets on DTR resets here, and
+bytes still in the driver's buffer are lost. Both keys need a running session
+worker and do not apply to `sio share` sessions. A worker from an older build
+never receives these requests: the shell keeps the keys local, explains, and
+sends nothing, so restart that worker with `sio stop` and `sio open`.
+
 `sio tee` keeps the port open in the foreground and writes serial output to the
 terminal, the requested file, and the session cache.
 
@@ -540,13 +553,30 @@ sio stop dev1
 sio rm dev1
 ```
 
-`pause` and `resume` update local session state for workflows that need temporary
-exclusive access, such as burn or flash steps.
+`pause` hands the serial port to another program for workflows that need
+temporary exclusive access, such as burn or flash steps: the session worker
+closes the port handle (the same lease `sio shell` uses for Ctrl+S) and keeps
+running, so the cache, `status`, and an attached shell stay available, and the
+other program can open the port. The session is marked paused, so `send`, `ask`,
+`sz`, `rz`, `shell`, and `tee` refuse until `resume`. Without a running worker
+`pause` only marks the session, because the port is already free. Closing the
+port drops DTR, so a board that resets on DTR restarts on `pause` and again when
+`resume` reopens it. `pause` refuses a sharing session (stop it instead) and a
+worker from an older build that cannot release the port. An attached
+`sio shell` keeps streaming device output; its input is dropped with one notice
+until the port is back, and Ctrl+R there takes the port back even while the
+session stays paused.
+
+`resume` asks the worker for the port back. While another program still holds
+it, `resume` fails, the session stays paused, and the next `resume` retries once
+that program closes the port. Without a running worker `resume` only clears the
+flag.
 
 `status` reports saved resources and PID liveness as `running`, `stale`, or
 `stopped`. `stale` means a PID is saved in state but the matching process no
-longer appears to be running. `sio stop dev1` should still be safe and should
-clean only `dev1`.
+longer appears to be running. A port lent out by `sio pause` or `sio shell` Ctrl+S adds
+`port_state: released`. `sio stop dev1` should still be safe and should clean
+only `dev1`.
 
 ## Design goals
 
@@ -725,7 +755,12 @@ Important files:
 state.json
 cache.log
 worker.log
+port.released
 ```
+
+`port.released` exists only while a worker has closed the port because `sio
+shell` lent it to another program, and the worker removes it when the port
+reopens or the worker exits.
 
 Use `sio log <session>` for `worker.log` when diagnosing sessions and share
 workers.

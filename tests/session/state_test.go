@@ -220,3 +220,33 @@ func TestStoreRemembersLastTransferDir(t *testing.T) {
 		t.Fatalf("LastTransferDir for a removed folder = %q", got)
 	}
 }
+
+func TestStorePortReleasedMarkerFollowsTheWorker(t *testing.T) {
+	store := session.Store{Dir: t.TempDir()}
+	if err := store.Save(session.State{Name: "dev1", Port: "COM3", Baud: 115200}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if store.PortReleased("dev1") {
+		t.Fatal("a fresh session reports a released port")
+	}
+
+	if err := store.MarkPortReleased("dev1"); err != nil {
+		t.Fatalf("MarkPortReleased: %v", err)
+	}
+	if !store.PortReleased("dev1") {
+		t.Fatal("marked port is not reported released")
+	}
+	if filepath.Dir(store.PortReleasedPath("dev1")) != store.SessionDir("dev1") {
+		t.Fatalf("PortReleasedPath %q is not in the session dir", store.PortReleasedPath("dev1"))
+	}
+
+	if err := store.Stop("dev1"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if store.PortReleased("dev1") {
+		t.Fatal("stopping the session left the released marker")
+	}
+	if err := store.ClearPortReleased("dev1"); err != nil {
+		t.Fatalf("ClearPortReleased on a missing marker: %v", err)
+	}
+}

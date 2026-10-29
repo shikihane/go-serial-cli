@@ -70,7 +70,13 @@ type AppDeps struct {
 	// TerminalWidth reports the columns of the terminal out writes to, or
 	// 0 when it is none. sio shell shows its transfer panel only then.
 	TerminalWidth func(out io.Writer) int
-	Version       VersionInfo
+	// TerminalRows reports the visible rows of the terminal out writes to
+	// and the row the cursor sits on, counted from the top of the window.
+	// A negative cursor row means it is unknown; rows 0 means no terminal.
+	// sio shell needs both to clear the screen with a scroll that keeps
+	// earlier output in the terminal's scrollback.
+	TerminalRows func(out io.Writer) (rows, cursorRow int)
+	Version      VersionInfo
 }
 
 func New(deps AppDeps) *App {
@@ -248,6 +254,7 @@ func DefaultDeps() (AppDeps, error) {
 		Stdin:                 os.Stdin,
 		ConfigureShellConsole: configureShellConsole,
 		TerminalWidth:         terminalWidth,
+		TerminalRows:          terminalRows,
 	}, nil
 }
 
@@ -917,7 +924,11 @@ func (a *App) runShell(args []string, out io.Writer) error {
 			terminal := out
 			hooks.width = func() int { return a.deps.TerminalWidth(terminal) }
 		}
-		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath, hooks.width, a.shellPortLease(name))
+		if a.deps.TerminalRows != nil {
+			terminal := out
+			hooks.height = func() (int, int) { return a.deps.TerminalRows(terminal) }
+		}
+		wrappedInput, wrappedOutput, cleanup, state := shellInputWithInterrupts(input, a.deps.ShellInterrupts, out, historyPath, hooks.width, hooks.height, a.shellPortLease(name))
 		defer cleanup()
 		if restoreConsole != nil {
 			defer restoreConsole()
@@ -999,6 +1010,7 @@ type shellTransferHooks struct {
 	active  func(bool)
 	rawKeys func(bool)
 	width   func() int
+	height  func() (rows, cursorRow int)
 }
 
 // Exit codes of sio sz and sio rz. The last output line names the outcome
@@ -1393,11 +1405,12 @@ const shellPromptRedrawDelay = 100 * time.Millisecond
 // to the transfer and never counts toward leaving the shell, and the
 // input prompt is not redrawn over the progress line. Raw keys pass keys
 // on with no echo while the transfer panel is shown.
-func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string, width func() int, lease *shellLease) (io.Reader, io.Writer, func(), *shellInputState) {
+func shellInputWithInterrupts(input io.Reader, interrupts <-chan os.Signal, echo io.Writer, historyPath string, width func() int, height func() (rows, cursorRow int), lease *shellLease) (io.Reader, io.Writer, func(), *shellInputState) {
 	reader, writer := io.Pipe()
 	stop := make(chan struct{})
 	state := newShellInputState(echo, historyPath, lease)
 	state.width = width
+	state.height = height
 	state.prompt()
 	var notifyCh chan os.Signal
 	signalCh := interrupts
@@ -1507,6 +1520,7 @@ type shellInputState struct {
 	menuIndex      int
 	menuRows       int
 	width          func() int
+	height         func() (rows, cursorRow int)
 	prompted       bool
 	promptVisible  bool
 	partialPending bool
@@ -1761,8 +1775,9 @@ func (s *shellInputState) inTransfer() bool {
 	return s.transfer
 }
 
-// clearScreenLocked clears the screen and, where the terminal supports it,
-// the scrollback, then draws the prompt again.
+// clearScreenLocked clears the screen the way a terminal's own clear does:
+// one full screen of lines is rolled into the terminal's scrollback, so no
+// earlier output is lost, and the prompt is drawn again at the top.
 func (s *shellInputState) clearScreenLocked() {
 	if s.echo == nil || s.transfer {
 		return
@@ -1773,9 +1788,39 @@ func (s *shellInputState) clearScreenLocked() {
 	s.menuRows = 0
 	s.promptVisible = false
 	s.prompted = false
-	_, _ = s.echo.Write([]byte("\x1b[H\x1b[2J\x1b[3J"))
+	_, _ = s.echo.Write(s.scrollClearSequence())
 	s.prompt()
 	s.redraw()
+}
+
+// scrollClearSequence rolls the visible screen into the scrollback and puts
+// the cursor on the top row. Without a measurable terminal the clear can
+// only erase the visible screen, which still leaves the scrollback alone.
+func (s *shellInputState) scrollClearSequence() []byte {
+	rows, cursorRow := 0, -1
+	if s.height != nil {
+		rows, cursorRow = s.height()
+	}
+	if rows <= 0 {
+		return []byte("\x1b[H\x1b[2J")
+	}
+	var b strings.Builder
+	if cursorRow < 0 || cursorRow >= rows {
+		// Without a cursor row the sequence starts at the last row; that
+		// absolute move is only safe where the terminal addresses the
+		// visible screen, which is the case on unix.
+		fmt.Fprintf(&b, "\x1b[%d;1H", rows)
+		cursorRow = rows - 1
+	}
+	// A newline only scrolls once it reaches the last row, so the count
+	// covers both the rows below the cursor and one full screen above it.
+	b.WriteString(strings.Repeat("\r\n", 2*rows-1-cursorRow))
+	if up := rows - 1; up > 0 {
+		// Relative motion lands on the top row whatever the terminal uses
+		// as the origin of absolute addresses.
+		fmt.Fprintf(&b, "\x1b[%dA", up)
+	}
+	return []byte(b.String())
 }
 
 // dropLineLocked forgets and erases the line being edited.

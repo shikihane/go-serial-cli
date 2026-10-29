@@ -61,6 +61,21 @@ func terminalWidth(out io.Writer) int {
 	return int(info.Window.Right-info.Window.Left) + 1
 }
 
+// terminalRows returns the visible rows of the console out writes to and
+// the row the cursor sits on, or zeros when out is no console.
+func terminalRows(out io.Writer) (int, int) {
+	f, ok := out.(*os.File)
+	if !ok {
+		return 0, 0
+	}
+	var info windows.ConsoleScreenBufferInfo
+	if err := windows.GetConsoleScreenBufferInfo(windows.Handle(f.Fd()), &info); err != nil {
+		return 0, 0
+	}
+	rows := int(info.Window.Bottom-info.Window.Top) + 1
+	return rows, int(info.CursorPosition.Y) - int(info.Window.Top)
+}
+
 func shellConsoleInput(input io.Reader) io.Reader {
 	if input != os.Stdin {
 		return input

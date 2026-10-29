@@ -499,7 +499,9 @@ Backspace remain local editing keys. Exiting shell leaves the background worker
 running. On Windows, one Ctrl+C sends byte `0x03` to the device; a second
 interrupt shortly after exits the shell.
 
-Ctrl+L clears the screen (and the scrollback where the terminal supports it) and redraws the prompt. Ctrl+S lends the
+Ctrl+L clears the screen by scrolling one full screen of lines into the
+terminal's scrollback, so earlier output stays reachable with the terminal's
+own scrollback and is never erased, and draws the prompt again at the top. Ctrl+S lends the
 serial port to another program: the session worker closes the handle and keeps
 running, so `cache.log`, `sio read`, and the shell stay in place, and the other
 program can open the port. While it is lent out, keys meant for the device are
